@@ -2,7 +2,7 @@
 
 > Ghidra, con una interfaz que encaja mejor en un Mac.
 
-![Descompilador](docs/capturas/02-descompilador.jpg)
+![Descompilador](docs/capturas/00-instalador-dmg.jpg)
 
 **Ghidra Studio ofrece** una interfaz hecha con SwiftUI que utiliza el motor de Ghidra para analizar los programas. El análisis sigue a cargo de Ghidra; Studio presenta sus resultados en una interfaz nueva.
 

@@ -6,15 +6,6 @@
 
 **Ghidra Studio ofrece** una interfaz hecha con SwiftUI que utiliza el motor de Ghidra para analizar los programas. El análisis sigue a cargo de Ghidra; Studio presenta sus resultados en una interfaz nueva.
 
-El repositorio incluye dos apps:
-
-| App | Qué ofrece |
-|---|---|
-| `Ghidra.app` | Ghidra clásico empaquetado para Mac, con Java incluido y soporte para Apple Silicon. |
-| `Ghidra Studio.app` | La nueva interfaz para Mac, creada con SwiftUI. |
-
----
-
 ## Capturas
 
 ### Inicio

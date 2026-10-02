@@ -30,6 +30,12 @@ struct ProjectTreeView: View {
                             }
                         }
                         Button(tr("Abrir en Ghidra clásico")) { model.openProjectInClassic() }
+                        Divider()
+                        Button(tr("Restaurar un proyecto archivado…")) { model.restoreProject() }
+                        Button(tr("Tabla, otros proyectos, check-outs, bibliotecas…")) { model.windowRequest = "projecttools" }
+                        if model.projectClipboard != nil {
+                            Button(tr("Pegar en la raíz")) { model.pasteProjectItem(into: "/") }
+                        }
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
@@ -100,6 +106,11 @@ private struct FolderContents: View {
                     .contextMenu {
                         Button(tr("Nueva carpeta…")) { model.requestNewFolder(parent: sub.path) }
                         Button(tr("Renombrar…")) { model.requestRenameItem(path: sub.path, name: sub.name, folder: true) }
+                        Button(tr("Copiar")) { model.projectClipboard = ProjectClip(path: sub.path, folder: true) }
+                        if model.projectClipboard != nil {
+                            Button(tr("Pegar aquí")) { model.pasteProjectItem(into: sub.path) }
+                        }
+                        Button(tr("Crear un enlace en la raíz")) { model.linkProjectItem(path: sub.path, folder: true, into: "/") }
                         Divider()
                         Button(tr("Borrar carpeta"), role: .destructive) {
                             model.deleteProjectItem(path: sub.path, name: sub.name, folder: true)
@@ -135,6 +146,14 @@ private struct ProjectFileRow: View {
                     if file.open {
                         Text(tr("abierto")).font(.caption2.weight(.semibold)).foregroundStyle(.tint)
                     }
+                    if file.versioned == true {
+                        Label("v\(file.version ?? 0)", systemImage: file.checkedOut == true ? "checkmark.circle" : "lock")
+                            .labelStyle(.titleAndIcon)
+                            .font(.caption2)
+                            .foregroundStyle(file.checkedOut == true ? Color.green : Color.secondary)
+                            .help(file.checkedOut == true ? tr("En control de versiones, con check-out")
+                                                         : tr("En control de versiones: haz check-out para modificarlo"))
+                    }
                 }
                 Text([file.format, file.processor].compactMap { $0 }.joined(separator: " · "))
                     .font(.caption)
@@ -145,6 +164,14 @@ private struct ProjectFileRow: View {
         .contextMenu {
             Button(tr("Abrir")) { model.openProgram(domainPath: file.path) }
             Button(tr("Renombrar…")) { model.requestRenameItem(path: file.path, name: file.name, folder: false) }
+            Button(tr("Copiar")) { model.projectClipboard = ProjectClip(path: file.path, folder: false) }
+            Menu(tr("Crear un enlace en")) {
+                ForEach(model.projectFolders, id: \.path) { folder in
+                    Button(folder.path) { model.linkProjectItem(path: file.path, folder: false, into: folder.path) }
+                }
+            }
+            Button(tr("Solo lectura: poner")) { model.setReadOnly(path: file.path, true) }
+            Button(tr("Solo lectura: quitar")) { model.setReadOnly(path: file.path, false) }
             Menu(tr("Mover a")) {
                 ForEach(model.projectFolders, id: \.path) { folder in
                     Button(folder.path) { model.projectAction("moveItem", ["path": file.path, "folder": folder.path]) }
@@ -175,16 +202,21 @@ struct ImportSheet: View {
     @State private var languageQuery = ""
     @State private var customLanguage: String?
     @State private var customCompiler: String?
+    @State private var showLoaderOptions = false
+    @State private var loaderOptions: [LoaderOption] = []
+    @State private var defaults: [String: String] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 12) {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: request.url.path))
+                Image(nsImage: request.isLocalFile ? NSWorkspace.shared.icon(forFile: request.source)
+                                                   : NSWorkspace.shared.icon(for: .data))
                     .resizable()
                     .frame(width: 48, height: 48)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(tr("Importar %@", "\(request.url.lastPathComponent)")).font(.title3.weight(.semibold))
-                    Text(request.url.deletingLastPathComponent().path)
+                    Text(tr("Importar %@", "\(request.name)")).font(.title3.weight(.semibold))
+                    Text(request.isLocalFile ? (request.source as NSString).deletingLastPathComponent
+                                             : tr("Dentro de un contenedor"))
                         .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
                 }
             }
@@ -217,7 +249,7 @@ struct ImportSheet: View {
                         }
                         .tag(lang.id)
                     }
-                    .frame(height: 160)
+                    .frame(height: 140)
                     if let lang = languages.first(where: { $0.id == customLanguage }), lang.compilers.count > 1 {
                         Picker(tr("Compilador"), selection: $customCompiler) {
                             ForEach(lang.compilers, id: \.self) { Text($0).tag(Optional($0)) }
@@ -225,9 +257,24 @@ struct ImportSheet: View {
                     }
                 }
                 Toggle(tr("Analizar automáticamente"), isOn: $analyze)
+                if !loaderOptions.isEmpty {
+                    Toggle(tr("Opciones del cargador"), isOn: $showLoaderOptions)
+                    if showLoaderOptions {
+                        ForEach($loaderOptions) { $opt in
+                            if opt.type == "bool" {
+                                Toggle(opt.name, isOn: Binding(get: { opt.value == "true" },
+                                                               set: { opt.value = $0 ? "true" : "false" }))
+                                    .toggleStyle(.checkbox)
+                            } else {
+                                TextField(opt.name, text: $opt.value)
+                                    .font(.body.monospaced())
+                            }
+                        }
+                    }
+                }
             }
             .formStyle(.grouped)
-            .frame(minHeight: useCustomLanguage ? 420 : 220)
+            .frame(minHeight: useCustomLanguage || showLoaderOptions ? 460 : 250)
 
             HStack {
                 Spacer()
@@ -235,9 +282,12 @@ struct ImportSheet: View {
                     .keyboardShortcut(.cancelAction)
                 Button(tr("Importar")) {
                     let spec = useCustomLanguage ? nil : specs.first { $0.id == selectedSpec }
-                    model.importFile(request.url, folder: folder, spec: spec,
+                    var args: [String: String] = [:]
+                    for o in loaderOptions where defaults[o.arg] != o.value { args[o.arg] = o.value }
+                    model.importFile(request, folder: folder, spec: spec,
                                      language: useCustomLanguage ? customLanguage : nil,
-                                     compiler: useCustomLanguage ? customCompiler : nil, analyze: analyze)
+                                     compiler: useCustomLanguage ? customCompiler : nil, analyze: analyze,
+                                     loaderArgs: args)
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
@@ -246,12 +296,17 @@ struct ImportSheet: View {
             }
         }
         .padding(22)
-        .frame(width: 560)
+        .frame(width: 580)
         .task {
-            specs = (try? await model.engine.call("loadSpecs", ["path": request.url.path])) ?? []
+            specs = (try? await model.engine.call("loadSpecs", ["path": request.source])) ?? []
             selectedSpec = (specs.first { $0.preferred } ?? specs.first)?.id
             if specs.isEmpty { useCustomLanguage = true }
             loading = false
+        }
+        .task(id: selectedSpec) {
+            guard let spec = specs.first(where: { $0.id == selectedSpec }) else { return }
+            loaderOptions = (try? await model.engine.call("loaderOptions", ["path": request.source, "loader": spec.loader])) ?? []
+            defaults = Dictionary(uniqueKeysWithValues: loaderOptions.map { ($0.arg, $0.value) })
         }
         .onChange(of: useCustomLanguage) { _, on in
             if on && languages.isEmpty {
@@ -268,6 +323,124 @@ struct ImportSheet: View {
         return languages.filter {
             $0.id.localizedCaseInsensitiveContains(languageQuery)
                 || $0.description.localizedCaseInsensitiveContains(languageQuery)
+        }
+    }
+}
+
+// MARK: - Container browser (zip, firmware, disk images, dyld cache…)
+
+struct ContainerBrowserSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let request: ContainerRequest
+    @State private var root: FSListing?
+    @State private var inspected: FSEntry?
+    @State private var selection: FSEntry.ID?
+    @State private var entriesByID: [String: FSEntry] = [:]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Image(systemName: "archivebox.fill").font(.largeTitle).foregroundStyle(.tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(request.url.lastPathComponent).font(.title3.weight(.semibold))
+                    Text(root?.type ?? tr("Abriendo contenedor…")).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            List(selection: $selection) {
+                if let root {
+                    ForEach(root.entries) { entry in
+                        FSEntryRow(entry: entry, register: { entriesByID[$0.id] = $0 }, selection: $selection) { picked in
+                            dismiss()
+                            model.importRequest = ImportRequest(entry: picked)
+                        }
+                    }
+                } else {
+                    ProgressView()
+                }
+            }
+            .frame(height: 360)
+            HStack {
+                Button(tr("Importar el archivo entero")) {
+                    model.importRequest = ImportRequest(url: request.url)
+                    dismiss()
+                }
+                Button(tr("Información, vista previa y extraer…")) {
+                    if let id = selection { inspected = entriesByID[id] }
+                }
+                .disabled(selection == nil)
+                ContainerActionsMenu(container: request.url.path, containerName: request.url.lastPathComponent,
+                                     entry: selection.flatMap { entriesByID[$0] })
+                Button(tr("Por lotes…")) {
+                    dismiss()
+                    model.batchRequest = BatchRequest(urls: [request.url])
+                }
+                .help(tr("Importar todos los programas del contenedor con el importador por lotes"))
+                Spacer()
+                Button(tr("Cancelar"), role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(tr("Importar selección")) {
+                    if let id = selection, let entry = entriesByID[id] {
+                        dismiss()
+                        model.importRequest = ImportRequest(entry: entry)
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.glassProminent)
+                .disabled(selection.flatMap { entriesByID[$0] }.map(\.directory) ?? true)
+            }
+        }
+        .padding(22)
+        .frame(width: 760)
+        .sheet(item: $inspected) { entry in FSFileSheet(entry: entry) }
+        .task {
+            root = try? await model.engine.call("fsList", ["path": request.url.path])
+            for e in root?.entries ?? [] { entriesByID[e.id] = e }
+        }
+    }
+}
+
+private struct FSEntryRow: View {
+    @Environment(AppModel.self) private var model
+    let entry: FSEntry
+    let register: (FSEntry) -> Void
+    @Binding var selection: FSEntry.ID?
+    let open: (FSEntry) -> Void
+    @State private var expanded = false
+    @State private var children: [FSEntry]?
+
+    var body: some View {
+        if entry.directory {
+            DisclosureGroup(isExpanded: $expanded) {
+                if let children {
+                    ForEach(children) { FSEntryRow(entry: $0, register: register, selection: $selection, open: open) }
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+            } label: {
+                Label(entry.name, systemImage: "folder.fill")
+            }
+            .tag(entry.id)
+            .onChange(of: expanded) { _, isOpen in
+                guard isOpen, children == nil else { return }
+                Task {
+                    let listing: FSListing? = try? await model.engine.call("fsList", ["path": entry.fsrl])
+                    children = listing?.entries ?? []
+                    children?.forEach(register)
+                }
+            }
+        } else {
+            HStack {
+                Label(entry.name, systemImage: "doc")
+                Spacer()
+                Text(ByteCountFormatter.string(fromByteCount: entry.size, countStyle: .file))
+                    .font(.caption).foregroundStyle(.secondary)
+                Button(tr("Importar")) { open(entry) }
+                    .controlSize(.small)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture(count: 2) { open(entry) }
+            .onTapGesture { selection = entry.id }
+            .tag(entry.id)
         }
     }
 }

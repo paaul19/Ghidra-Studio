@@ -5,6 +5,7 @@
 # Environment overrides (same as upstream ghidraRun):
 #   GHIDRA_MAXMEM / GHIDRA_GUI_MAXMEM          e.g. 8G
 #   GHIDRA_JAVA_OPTIONS / GHIDRA_GUI_JAVA_OPTIONS
+#   GHIDRA_MAIN_CLASS                          class to launch instead of ghidra.GhidraRun
 
 RES="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 GHIDRA_HOME="$RES/ghidra"
@@ -45,4 +46,4 @@ done
 
 exec "$JAVA" "${VMARGS[@]}" "${EXTRA[@]}" \
 	-cp "$GHIDRA_HOME/Ghidra/Framework/Utility/lib/Utility.jar" \
-	ghidra.Ghidra ghidra.GhidraRun "${ARGS[@]}"
+	ghidra.Ghidra "${GHIDRA_MAIN_CLASS:-ghidra.GhidraRun}" "${ARGS[@]}"

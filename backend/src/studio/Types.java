@@ -142,15 +142,28 @@ final class Types {
 	}
 
 	static Map<String, Object> detail(Program program, String path) throws Exception {
-		DataType dt = find(program, path);
+		return describe(program, find(program, path));
+	}
+
+	/** What the interface shows of a type; also used for the working copy of the structure editor. */
+	static Map<String, Object> describe(Program program, DataType dt) {
 		Map<String, Object> m = map("path", dt.getPathName(), "name", dt.getName(), "kind", kind(dt),
 			"size", dt.getLength(), "description", dt.getDescription(),
 			"editable", dt.getDataTypeManager() == program.getDataTypeManager());
+		if (dt instanceof Composite comp) {
+			m.put("packed", comp.isPackingEnabled());
+			m.put("packValue", comp.hasExplicitPackingValue() ? comp.getExplicitPackingValue() : 0);
+			m.put("alignment", comp.getAlignment());
+		}
 		List<Map<String, Object>> fields = new ArrayList<>();
 		if (dt instanceof Composite c) {
 			for (DataTypeComponent comp : c.getDefinedComponents()) {
+				String type = comp.getDataType().getDisplayName();
+				if (comp.isBitFieldComponent() && comp.getDataType() instanceof BitFieldDataType bf) {
+					type = bf.getBaseDataType().getDisplayName() + " : " + bf.getDeclaredBitSize();
+				}
 				fields.add(map("ordinal", comp.getOrdinal(), "offset", comp.getOffset(), "length", comp.getLength(),
-					"type", comp.getDataType().getDisplayName(), "name", comp.getFieldName(), "comment", comp.getComment()));
+					"type", type, "name", comp.getFieldName(), "comment", comp.getComment()));
 			}
 		}
 		else if (dt instanceof Enum e) {
@@ -260,6 +273,151 @@ final class Types {
 			e.add(name, value);
 			return true;
 		});
+	}
+
+	private static Structure structure(Session s, String path) {
+		if (composite(s, path) instanceof Structure st) {
+			return st;
+		}
+		throw new IllegalArgumentException("Solo disponible para estructuras");
+	}
+
+	static Object insertField(Session s, String path, int offset, String type, String name, String comment)
+			throws Exception {
+		Structure st = structure(s, path);
+		DataType dt = parse(s.program, type);
+		return s.edit("Insertar campo", () -> {
+			int len = dt.getLength() > 0 ? dt.getLength() : 1;
+			if (st.isPackingEnabled() || offset >= st.getLength()) {
+				st.insertAtOffset(offset, dt, len, name, comment);
+			}
+			else {
+				st.replaceAtOffset(offset, dt, len, name, comment);
+			}
+			return true;
+		});
+	}
+
+	static Object moveField(Session s, String path, int ordinal, int delta) throws Exception {
+		Composite c = composite(s, path);
+		return s.edit("Mover campo", () -> {
+			int target = ordinal + delta;
+			if (target < 0 || target >= c.getNumComponents()) {
+				return false;
+			}
+			DataTypeComponent comp = c.getComponent(ordinal);
+			DataType dt = comp.getDataType();
+			int len = comp.getLength();
+			String name = comp.getFieldName();
+			String comment = comp.getComment();
+			c.delete(ordinal);
+			c.insert(target, dt, len, name, comment);
+			return true;
+		});
+	}
+
+	static Object addBitField(Session s, String path, String baseType, int bits, String name) throws Exception {
+		Composite c = composite(s, path);
+		DataType dt = parse(s.program, baseType);
+		return s.edit("Añadir campo de bits", () -> {
+			c.addBitField(dt, bits, name, null);
+			return true;
+		});
+	}
+
+	static Object setPacking(Session s, String path, boolean enabled, int value) throws Exception {
+		Composite c = composite(s, path);
+		return s.edit("Empaquetado", () -> {
+			if (!enabled) {
+				c.setPackingEnabled(false);
+			}
+			else if (value > 0) {
+				c.setExplicitPackingValue(value);
+			}
+			else {
+				c.setToDefaultPacking();
+			}
+			return true;
+		});
+	}
+
+	static Object setAlignment(Session s, String path, int value) throws Exception {
+		Composite c = composite(s, path);
+		return s.edit("Alineación", () -> {
+			if (value > 0) {
+				c.setExplicitMinimumAlignment(value);
+			}
+			else {
+				c.setToDefaultAligned();
+			}
+			return true;
+		});
+	}
+
+	static Object setStructSize(Session s, String path, int size) throws Exception {
+		Structure st = structure(s, path);
+		return s.edit("Tamaño de estructura", () -> {
+			st.setLength(size);
+			return true;
+		});
+	}
+
+	static Object removeEnumValue(Session s, String path, String name) throws Exception {
+		DataType dt = find(s.program, path);
+		if (!(dt instanceof Enum e)) {
+			throw new IllegalArgumentException("No es un enum");
+		}
+		return s.edit("Quitar valor", () -> {
+			e.remove(name);
+			return true;
+		});
+	}
+
+	/** Types contained in a .gdt archive. */
+	static List<Map<String, Object>> archiveTypes(String path, String filter) throws Exception {
+		FileDataTypeManager dtm = FileDataTypeManager.openFileArchive(new java.io.File(path), false);
+		try {
+			String f = filter == null ? "" : filter.toLowerCase();
+			List<DataType> all = new ArrayList<>();
+			dtm.getAllDataTypes(all);
+			List<Map<String, Object>> out = new ArrayList<>();
+			for (DataType dt : all) {
+				if (out.size() >= 3000) {
+					break;
+				}
+				if (dt instanceof Pointer || dt instanceof Array || (!f.isEmpty() && !dt.getName().toLowerCase().contains(f))) {
+					continue;
+				}
+				out.add(map("path", dt.getPathName(), "name", dt.getName(), "category", dt.getCategoryPath().getPath(),
+					"kind", kind(dt), "size", dt.getLength(), "builtin", false));
+			}
+			out.sort(Comparator.comparing(o -> ((String) o.get("name")).toLowerCase()));
+			return out;
+		}
+		finally {
+			dtm.close();
+		}
+	}
+
+	/** Copies types (with their dependencies) from a .gdt archive into the program. */
+	static Object importArchiveTypes(Session s, String path, List<String> typePaths) throws Exception {
+		FileDataTypeManager dtm = FileDataTypeManager.openFileArchive(new java.io.File(path), false);
+		try {
+			return s.edit("Importar tipos", () -> {
+				int n = 0;
+				for (String tp : typePaths) {
+					DataType dt = dtm.getDataType(toPath(tp));
+					if (dt != null) {
+						s.program.getDataTypeManager().resolve(dt, DataTypeConflictHandler.DEFAULT_HANDLER);
+						n++;
+					}
+				}
+				return map("applied", n);
+			});
+		}
+		finally {
+			dtm.close();
+		}
 	}
 
 	static Object renameType(Session s, String path, String newName) throws Exception {

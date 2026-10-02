@@ -143,4 +143,130 @@ final class Search {
 		}
 		return out;
 	}
+
+	/**
+	 * Like Search > For Instruction Patterns: takes the instructions in [start, end], masks out their
+	 * operands (keeping only the opcode bits) and finds every other place with the same shape.
+	 */
+	static Map<String, Object> instructionPattern(Session s, Address start, Address end, boolean maskOperands) {
+		Program p = s.program;
+		java.io.ByteArrayOutputStream values = new java.io.ByteArrayOutputStream();
+		java.io.ByteArrayOutputStream masks = new java.io.ByteArrayOutputStream();
+		StringBuilder shown = new StringBuilder();
+		int count = 0;
+		for (Instruction ins : p.getListing().getInstructions(new ghidra.program.model.address.AddressSet(start, end), true)) {
+			if (count++ >= 16) {
+				break;
+			}
+			try {
+				byte[] bytes = ins.getBytes();
+				byte[] mask = new byte[bytes.length];
+				if (maskOperands) {
+					byte[] im = ins.getPrototype().getInstructionMask().getBytes();
+					System.arraycopy(im, 0, mask, 0, Math.min(im.length, mask.length));
+				}
+				else {
+					Arrays.fill(mask, (byte) 0xff);
+				}
+				for (int i = 0; i < bytes.length; i++) {
+					values.write(bytes[i] & mask[i]);
+					masks.write(mask[i]);
+					shown.append(mask[i] == (byte) 0xff ? String.format("%02x ", bytes[i] & 0xff)
+							: mask[i] == 0 ? "?? " : String.format("%02x* ", bytes[i] & mask[i] & 0xff));
+				}
+			}
+			catch (Exception e) {
+				throw new IllegalStateException("No se pudo leer la instrucción en " + ins.getAddress());
+			}
+		}
+		if (count == 0) {
+			throw new IllegalArgumentException("Selecciona una o varias instrucciones");
+		}
+		byte[] v = values.toByteArray();
+		byte[] m = masks.toByteArray();
+		Memory mem = p.getMemory();
+		CodeUnitFormat fmt = new CodeUnitFormat(new CodeUnitFormatOptions());
+		List<Map<String, Object>> out = new ArrayList<>();
+		for (MemoryBlock block : mem.getBlocks()) {
+			if (!block.isInitialized() || !block.isExecute()) {
+				continue;
+			}
+			Address cur = block.getStart();
+			while (cur != null && out.size() < MAX_RESULTS) {
+				Address found = mem.findBytes(cur, block.getEnd(), v, m, true, TaskMonitor.DUMMY);
+				if (found == null) {
+					break;
+				}
+				Instruction ins = p.getListing().getInstructionAt(found);
+				if (ins != null) {
+					StringBuilder sb = new StringBuilder(ins.getMnemonicString());
+					for (int i = 0; i < ins.getNumOperands(); i++) {
+						sb.append(i == 0 ? " " : ", ").append(fmt.getOperandRepresentationString(ins, i));
+					}
+					out.add(hit(p, found, "Instrucción", sb.toString()));
+				}
+				try {
+					cur = found.add(1);
+				}
+				catch (Exception e) {
+					break;
+				}
+				if (cur.compareTo(block.getEnd()) > 0) {
+					break;
+				}
+			}
+		}
+		return map("pattern", shown.toString().trim(), "instructions", count, "results", out);
+	}
+
+	/** Search and replace in label names and/or comments. Returns how many items changed. */
+	static Object replace(Session s, String query, String replacement, boolean regex, boolean caseSensitive,
+			Set<String> scopes) throws Exception {
+		Pattern pat = regex ? Pattern.compile(query, caseSensitive ? 0 : Pattern.CASE_INSENSITIVE)
+				: Pattern.compile(Pattern.quote(query), caseSensitive ? 0 : Pattern.CASE_INSENSITIVE);
+		String repl = regex ? replacement : java.util.regex.Matcher.quoteReplacement(replacement);
+		return s.edit("Buscar y reemplazar", () -> {
+			Program p = s.program;
+			int changed = 0;
+			if (scopes.contains("labels")) {
+				List<Symbol> targets = new ArrayList<>();
+				SymbolIterator it = p.getSymbolTable().getAllSymbols(true);
+				while (it.hasNext()) {
+					Symbol sym = it.next();
+					if (!sym.isExternal() && !sym.isDynamic() && pat.matcher(sym.getName()).find()) {
+						targets.add(sym);
+					}
+				}
+				for (Symbol sym : targets) {
+					String name = pat.matcher(sym.getName()).replaceAll(repl);
+					if (!name.isBlank() && !name.equals(sym.getName())) {
+						try {
+							sym.setName(name, ghidra.program.model.symbol.SourceType.USER_DEFINED);
+							changed++;
+						}
+						catch (Exception ignored) {
+							// duplicate or invalid name: skip
+						}
+					}
+				}
+			}
+			if (scopes.contains("comments")) {
+				Listing listing = p.getListing();
+				for (CommentType type : CommentType.values()) {
+					List<Address> addrs = new ArrayList<>();
+					for (Address a : listing.getCommentAddressIterator(type, p.getMemory(), true)) {
+						addrs.add(a);
+					}
+					for (Address a : addrs) {
+						String c = listing.getComment(type, a);
+						if (c != null && pat.matcher(c).find()) {
+							listing.setComment(a, type, pat.matcher(c).replaceAll(repl));
+							changed++;
+						}
+					}
+				}
+			}
+			return map("applied", changed);
+		});
+	}
 }

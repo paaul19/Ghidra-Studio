@@ -124,7 +124,7 @@ struct InspectorView: View {
                            : x.type.contains("WRITE") ? "square.and.pencil" : "arrow.turn.up.right",
                        tint: .blue,
                        title: x.function ?? x.from,
-                       detail: "\(x.from) · \(x.type.lowercased())") {
+                       detail: "\(x.from) · \(x.type.lowercased())" + (x.via.map { " · thunk " + $0 } ?? "")) {
                     model.go(x.from)
                 }
             }

@@ -42,6 +42,11 @@ final class Json {
 		return e == null || e.isJsonNull() ? def : e.getAsInt();
 	}
 
+	/** JSON has no NaN / Infinity. */
+	static double num(double d) {
+		return Double.isNaN(d) ? 0 : Double.isInfinite(d) ? (d > 0 ? 1e308 : -1e308) : d;
+	}
+
 	static Map<String, Object> map(Object... kv) {
 		Map<String, Object> m = new LinkedHashMap<>();
 		for (int i = 0; i + 1 < kv.length; i += 2) {

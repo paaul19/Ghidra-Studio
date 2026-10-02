@@ -11,6 +11,11 @@ struct EmulatorView: View {
     @State private var follow = true
     @State private var memAddress = ""
     @State private var memBytes = ""
+    @State private var memDump = ""
+    @State private var newWatch = ""
+    @AppStorage("emuWatches") private var storedWatches = ""
+
+    private var watchList: [String] { storedWatches.split(separator: "\n").map(String.init).filter { !$0.isEmpty } }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -27,11 +32,21 @@ struct EmulatorView: View {
                         writesPanel
                     }
                     .frame(minWidth: 300)
+                    VStack(spacing: 0) {
+                        pcodePanel
+                        Divider()
+                        watchesPanel
+                        Divider()
+                        threadsPanel
+                    }
+                    .frame(minWidth: 300)
                 }
             }
         }
-        .frame(minWidth: 720, minHeight: 520)
-        .task(id: model.activeSession) { state = try? await model.engine.call("emuState") }
+        .windowMinSize(1060, 520)
+        .task(id: "\(model.activeSession ?? "")|\(model.emulatorRevision)") {
+            state = try? await model.engine.call("emuWatches", ["expressions": watchList])
+        }
         .alert(tr("Valor de %@", "\(editing?.name ?? "")"), isPresented: Binding(get: { editing != nil }, set: { if !$0 { editing = nil } })) {
             TextField("0x…", text: $editValue)
             Button(tr("Escribir")) {
@@ -39,6 +54,94 @@ struct EmulatorView: View {
             }
             Button(tr("Cancelar"), role: .cancel) {}
         }
+    }
+
+    private var pcodePanel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(tr("P-code de la instrucción")).font(.caption.weight(.semibold)).padding(8)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 1) {
+                    ForEach(Array((state?.pcode?.ops ?? []).enumerated()), id: \.offset) { i, op in
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrowtriangle.right.fill").font(.system(size: 7))
+                                .opacity(state?.pcode?.active == true && state?.pcode?.index == i ? 1 : 0)
+                                .foregroundStyle(.orange)
+                            Text(op).font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(state?.pcode?.active == true && i < (state?.pcode?.index ?? 0) ? .secondary : .primary)
+                        }
+                    }
+                    ForEach(state?.pcode?.uniques ?? [], id: \.self) { u in
+                        Text("\(u.name) = \(u.value)").font(.system(size: 11, design: .monospaced)).foregroundStyle(.teal)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+            }
+        }
+        .frame(minHeight: 140)
+    }
+
+    private var watchesPanel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text(tr("Expresiones vigiladas")).font(.caption.weight(.semibold))
+                TextField("x0, sp+8, *:4 (sp+0xc)", text: $newWatch).textFieldStyle(.roundedBorder).font(.caption.monospaced())
+                    .onSubmit(addWatch)
+                Button(tr("Añadir"), action: addWatch).disabled(newWatch.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .controlSize(.small)
+            .padding(8)
+            List(state?.watches ?? watchList.map { EmuWatch(expression: $0, value: "") }, id: \.self) { w in
+                HStack {
+                    Text(w.expression).font(.system(size: 11, design: .monospaced))
+                    Spacer()
+                    Text(w.value).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+                    Button {
+                        storedWatches = watchList.filter { $0 != w.expression }.joined(separator: "\n")
+                        call("emuWatches", ["expressions": watchList])
+                    } label: { Image(systemName: "minus.circle") }
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                }
+            }
+            .listStyle(.plain)
+        }
+        .frame(minHeight: 120)
+    }
+
+    private func addWatch() {
+        let text = newWatch.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty, !watchList.contains(text) else { return }
+        storedWatches = (watchList + [text]).joined(separator: "\n")
+        newWatch = ""
+        call("emuWatches", ["expressions": watchList])
+    }
+
+    private var threadsPanel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text(tr("Hilos")).font(.caption.weight(.semibold))
+                Spacer()
+                Button(tr("Nuevo hilo en el cursor")) {
+                    if let a = model.editTarget { call("emuNewThread", ["address": a]) }
+                }
+                .disabled(state?.running != true || model.editTarget == nil)
+                .help(tr("Otro hilo con sus registros y su pila; la memoria es la misma"))
+            }
+            .controlSize(.small)
+            .padding(8)
+            List(state?.threads ?? []) { t in
+                HStack {
+                    Image(systemName: t.current ? "play.fill" : "pause").foregroundStyle(t.current ? Color.accentColor : Color.secondary)
+                    Text(tr("Hilo %@", "\(t.index)"))
+                    Spacer()
+                    Text(t.pc).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { call("emuSwitchThread", ["index": t.index]) }
+            }
+            .listStyle(.plain)
+        }
+        .frame(minHeight: 90)
     }
 
     private var toolbarRow: some View {
@@ -54,12 +157,21 @@ struct EmulatorView: View {
                     .disabled(state?.running != true)
                 Button { call("emuStep", ["count": 10]) } label: { Label("×10", systemImage: "forward.frame") }
                     .disabled(state?.running != true)
+                Button { call("emuPcodeStep", ["count": 1]) } label: { Label(tr("Paso p-code"), systemImage: "arrow.down.right") }
+                    .keyboardShortcut("p", modifiers: [])
+                    .disabled(state?.running != true)
+                    .help(tr("Ejecuta una sola operación de p-code de la instrucción actual"))
                 Button { call("emuRun", [:]) } label: { Label(tr("Continuar"), systemImage: "forward.fill") }
                     .keyboardShortcut("r", modifiers: [])
                     .disabled(state?.running != true)
                 Button { call("emuStop", [:]) } label: { Label(tr("Detener"), systemImage: "stop.fill") }
                     .disabled(state?.running != true)
                 Spacer()
+                Toggle(tr("Saltar llamadas externas"), isOn: Binding(get: { state?.skipExternal ?? true }, set: { on in
+                    call("emuSkipExternal", ["on": on])
+                }))
+                .toggleStyle(.checkbox)
+                .help(tr("Al llegar a una función importada (printf, malloc…), vuelve al llamador en lugar de emular código que no está"))
                 Toggle(tr("Seguir en el código"), isOn: $follow).toggleStyle(.checkbox)
                 if busy { ProgressView().controlSize(.small) }
             }
@@ -133,14 +245,40 @@ struct EmulatorView: View {
                     Text(w.bytes).font(.callout.monospaced())
                 }
             }
+            if let log = state?.log, !log.isEmpty {
+                Text(tr("Llamadas externas saltadas: ") + log.suffix(8).joined(separator: ", "))
+                    .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(2)
+            }
+            if !memDump.isEmpty {
+                Text(memDump).font(.caption.monospaced()).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             HStack {
                 TextField(tr("Dirección"), text: $memAddress).frame(width: 130).font(.body.monospaced())
                 TextField(tr("Bytes (hex)"), text: $memBytes).font(.body.monospaced())
+                Button(tr("Leer")) { readMemory() }
+                    .disabled(memAddress.isEmpty || state?.running != true)
                 Button(tr("Escribir")) { call("emuWriteMemory", ["address": memAddress, "bytes": memBytes]) }
                     .disabled(memAddress.isEmpty || memBytes.isEmpty || state?.running != true)
             }
         }
         .padding(10)
+    }
+
+    private func readMemory() {
+        Task {
+            do {
+                let dump: HexDump = try await model.engine.call("emuReadMemory", ["address": memAddress, "length": 64])
+                var out = ""
+                for (i, chunk) in stride(from: 0, to: dump.bytes.count, by: 16).enumerated() {
+                    let row = dump.bytes[chunk..<min(chunk + 16, dump.bytes.count)]
+                    out += String(format: "+%02x  ", i * 16) + row.map { String(format: "%02x", $0) }.joined(separator: " ") + "\n"
+                }
+                memDump = out.trimmingCharacters(in: .newlines)
+            } catch {
+                model.errorMessage = error.localizedDescription
+            }
+        }
     }
 
     private func call(_ method: String, _ params: [String: Any]) {
@@ -173,6 +311,13 @@ struct CompareView: View {
     @State private var diffSelection: DiffRow.ID?
     @State private var busy = false
     @State private var onlyNamed = true
+    /// Diff: limit to the program selection, rows set aside, details of the chosen row and how each kind is applied.
+    @State private var selectionOnly = false
+    @State private var ignored = Set<String>()
+    @State private var details = ""
+    @State private var settings: [String: String] = [:]
+
+    private var shownDifferences: [DiffRow] { (diff?.differences ?? []).filter { !ignored.contains($0.id) } }
 
     private var candidates: [ProjectFile] {
         (model.project?.tree?.allFolders ?? []).flatMap(\.files).filter { $0.program && $0.path != model.activeSession }
@@ -206,7 +351,7 @@ struct CompareView: View {
                 if mode == 0 { diffPanel } else { matchPanel }
             }
         }
-        .frame(minWidth: 860, minHeight: 540)
+        .windowMinSize(860, 540)
     }
 
     private var diffPanel: some View {
@@ -215,26 +360,68 @@ struct CompareView: View {
                 Button(tr("Calcular diferencias")) { runDiff() }
                     .buttonStyle(.glassProminent)
                     .disabled(other == nil || busy)
-                Text(tr("Requiere programas con el mismo procesador y espacio de direcciones (dos versiones del mismo binario)."))
-                    .font(.caption).foregroundStyle(.secondary)
+                Toggle(tr("Solo en la selección"), isOn: $selectionOnly).toggleStyle(.checkbox)
+                    .disabled(model.programSelection == nil)
+                    .help(tr("Compara solo las direcciones de la selección del programa"))
+                Menu(tr("Cómo aplicar")) {
+                    ForEach(["Bytes", "Código/datos", "Símbolos", "Funciones", "Comentarios", "Referencias", "Equates", "Marcadores",
+                             "Contexto"], id: \.self) { kind in
+                        Picker(tr(kind), selection: Binding(get: { settings[kind] ?? "replace" }, set: { settings[kind] = $0 })) {
+                            Text(tr("Reemplazar")).tag("replace")
+                            if kind == "Comentarios" || kind == "Símbolos" { Text(tr("Fusionar")).tag("merge") }
+                            Text(tr("No aplicar")).tag("ignore")
+                        }
+                    }
+                }
+                .fixedSize()
+                .help(tr("Qué se hace con cada clase de diferencia al aplicar"))
                 Spacer()
+                Text(tr("Mismo procesador y espacio de direcciones.")).font(.caption).foregroundStyle(.secondary)
             }
             .padding(10)
-            Table(diff?.differences ?? [], selection: $diffSelection) {
+            Table(shownDifferences, selection: $diffSelection) {
                 TableColumn(tr("Dirección")) { d in Text(d.address).monospaced() }.width(min: 90, ideal: 110)
                 TableColumn(tr("Tipo")) { d in Text(tr(d.kind)) }.width(min: 80, ideal: 110)
                 TableColumn("Bytes") { d in Text("\(d.length)").monospacedDigit() }.width(60)
                 TableColumn(tr("Función")) { d in Text(d.function ?? "—").foregroundStyle(.secondary) }
             }
             .onChange(of: diffSelection) { _, id in
-                if let id, let d = diff?.differences.first(where: { $0.id == id }) { model.go(d.address) }
+                if let id, let d = diff?.differences.first(where: { $0.id == id }) {
+                    model.go(d.address)
+                    loadDetails(d.address)
+                }
+            }
+            if !details.isEmpty {
+                ScrollView {
+                    Text(details).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                }
+                .frame(height: 130)
+                .background(Color(nsColor: Theme.background))
             }
             if let diff {
                 HStack(alignment: .top, spacing: 20) {
-                    Text("\(diff.differences.count) diferencias\(diff.truncated ? " (truncado)" : "")")
+                    Text("\(shownDifferences.count) diferencias\(diff.truncated ? " (truncado)" : "")")
+                    Button(tr("Ignorar la seleccionada")) {
+                        guard let id = diffSelection else { return }
+                        // go on to the next one, like "Ignore and go to next"
+                        let list = shownDifferences
+                        let next = list.firstIndex { $0.id == id }.flatMap { $0 + 1 < list.count ? list[$0 + 1].id : nil }
+                        ignored.insert(id)
+                        diffSelection = next
+                    }
+                    .disabled(diffSelection == nil)
+                    if !ignored.isEmpty { Button(tr("Recuperar ignoradas (%@)", "\(ignored.count)")) { ignored = [] } }
                     if !diff.onlyInThis.isEmpty { Text(tr("Solo en este: %@", "\(diff.onlyInThis.prefix(3).joined(separator: ", "))")) }
                     if !diff.onlyInOther.isEmpty { Text(tr("Solo en el otro: %@", "\(diff.onlyInOther.prefix(3).joined(separator: ", "))")) }
                     Spacer()
+                    Button(tr("Aplicar la seleccionada")) {
+                        if let d = diff.differences.first(where: { $0.id == diffSelection }) { applyDiff([d]) }
+                    }
+                    .disabled(diffSelection == nil || busy)
+                    Button(tr("Aplicar todas a este programa")) { applyDiff(shownDifferences) }
+                        .disabled(shownDifferences.isEmpty || busy)
+                        .help(tr("Copia del otro programa bytes, código, símbolos, funciones, comentarios… en esas direcciones"))
                 }
                 .font(.caption).foregroundStyle(.secondary).padding(10)
             }
@@ -292,14 +479,52 @@ struct CompareView: View {
         }
     }
 
+    private func applyDiff(_ rows: [DiffRow]) {
+        guard let other, !rows.isEmpty else { return }
+        busy = true
+        Task {
+            defer { busy = false }
+            do {
+                let ranges = rows.map { ["address": $0.address, "end": $0.end] }
+                let kinds = Array(Set(rows.map(\.kind)))
+                let r: DiffApplyResult = try await model.engine.call("applyDiff", ["other": other, "ranges": ranges,
+                                                                                  "kinds": rows.count == 1 ? kinds : [],
+                                                                                  "settings": settings])
+                await model.refreshAfterEdits()
+                diff = try await model.engine.call("diff", diffParams(other))
+                if let e = r.error, !e.isEmpty { model.errorMessage = e }
+            } catch {
+                model.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
     private func runDiff() {
         guard let other else { return }
         busy = true
         Task {
             defer { busy = false }
-            do { diff = try await model.engine.call("diff", ["other": other]) } catch {
+            do {
+                diff = try await model.engine.call("diff", diffParams(other))
+                ignored = []
+                details = ""
+            } catch {
                 model.errorMessage = error.localizedDescription
             }
+        }
+    }
+
+    private func diffParams(_ other: String) -> [String: Any] {
+        var params: [String: Any] = ["other": other]
+        if selectionOnly, let selection = model.programSelection { params["ranges"] = selection.ranges }
+        return params
+    }
+
+    private func loadDetails(_ address: String) {
+        guard let other else { return }
+        Task {
+            let result: JSONRow? = try? await model.engine.call("diffDetails", ["other": other, "address": address])
+            details = result?["details"]?.text ?? ""
         }
     }
 
@@ -422,7 +647,11 @@ struct AddBlockSheet: View {
     @State private var name = "nuevo_bloque"
     @State private var start = ""
     @State private var length = "0x1000"
-    @State private var initialized = true
+    @State private var kind = "initialized"
+    @State private var overlay = false
+    @State private var source = ""
+
+    private var mapped: Bool { kind == "bit" || kind == "byte" }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -431,24 +660,36 @@ struct AddBlockSheet: View {
                 TextField(tr("Nombre"), text: $name)
                 TextField(tr("Dirección inicial"), text: $start).font(.body.monospaced())
                 TextField(tr("Tamaño"), text: $length).font(.body.monospaced())
-                Toggle(tr("Inicializado (rellenado con ceros)"), isOn: $initialized)
+                Picker(tr("Tipo"), selection: $kind) {
+                    Text(tr("Inicializado (ceros)")).tag("initialized")
+                    Text(tr("Sin inicializar")).tag("uninitialized")
+                    Text(tr("Mapeado por bytes")).tag("byte")
+                    Text(tr("Mapeado por bits")).tag("bit")
+                }
+                .pickerStyle(.segmented)
+                if mapped {
+                    TextField(tr("Dirección de origen que refleja"), text: $source).font(.body.monospaced())
+                }
+                Toggle(tr("Overlay: espacio de direcciones propio, puede solaparse con otros bloques"), isOn: $overlay)
             }
             .formStyle(.grouped)
             HStack {
                 Spacer()
                 Button(tr("Cancelar"), role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(tr("Añadir")) {
-                    model.memoryAction("addBlock", ["name": name, "address": start, "length": length,
-                                                    "initialized": initialized])
+                    var params: [String: Any] = ["name": name, "address": start, "length": length, "kind": kind,
+                                                 "overlay": overlay]
+                    if mapped { params["source"] = source }
+                    model.memoryAction("addBlockEx", params)
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.glassProminent)
-                .disabled(name.isEmpty || start.isEmpty || length.isEmpty)
+                .disabled(name.isEmpty || start.isEmpty || length.isEmpty || (mapped && source.isEmpty))
             }
         }
         .padding(22)
-        .frame(width: 440)
+        .frame(width: 520)
         .onAppear {
             if let last = model.segments.last, let end = addressValue(last.end) {
                 start = String((end + 0x1000) & ~0xfff, radix: 16)

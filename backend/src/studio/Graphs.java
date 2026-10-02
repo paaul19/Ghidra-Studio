@@ -43,6 +43,8 @@ final class Graphs {
 		for (int i = 0; i < ordered.size(); i++) {
 			CodeBlock b = ordered.get(i);
 			List<String> lines = new ArrayList<>();
+			// the address of each line, so that a line of a block can be edited like one of the listing
+			List<String> addresses = new ArrayList<>();
 			int total = 0;
 			InstructionIterator ins = listing.getInstructions(b, true);
 			while (ins.hasNext()) {
@@ -54,7 +56,16 @@ final class Graphs {
 					for (int op = 0; op < in.getNumOperands(); op++) {
 						sb.append(op == 0 ? " " : ", ").append(fmt.getOperandRepresentationString(in, op));
 					}
+					String comment = in.getComment(CommentType.EOL);
+					if (comment == null) {
+						comment = in.getComment(CommentType.PRE);
+					}
+					if (comment != null && !comment.isBlank()) {
+						String one = comment.replace('\n', ' ').strip();
+						sb.append("  ; ").append(one.length() > 40 ? one.substring(0, 39) + "…" : one);
+					}
 					lines.add(sb.toString());
+					addresses.add(str(in.getAddress()));
 				}
 			}
 			if (total > lines.size()) {
@@ -62,7 +73,7 @@ final class Graphs {
 			}
 			Symbol label = program.getSymbolTable().getPrimarySymbol(b.getFirstStartAddress());
 			blocks.add(map("id", i, "start", str(b.getFirstStartAddress()), "end", str(b.getMaxAddress()),
-				"label", label != null ? label.getName() : null, "lines", lines,
+				"label", label != null ? label.getName() : null, "lines", lines, "addresses", addresses,
 				"entry", b.getFirstStartAddress().equals(f.getEntryPoint())));
 
 			CodeBlockReferenceIterator dests = b.getDestinations(TaskMonitor.DUMMY);
@@ -208,6 +219,13 @@ final class Graphs {
 
 	/** References graph around an address (like the Data Graph): who points to it and what it points to. */
 	static Map<String, Object> referenceGraph(Session s, Address address, int depth) {
+		return referenceGraph(s, address, depth, "both");
+	}
+
+	/** direction: "to" (what refers to the address), "from" (what it refers to) or "both". */
+	static Map<String, Object> referenceGraph(Session s, Address address, int depth, String direction) {
+		int depthIn = direction.equals("from") ? 0 : depth;
+		int depthOut = direction.equals("to") ? 0 : depth;
 		Program p = s.program;
 		Map<String, Map<String, Object>> nodes = new LinkedHashMap<>();
 		Set<List<String>> edges = new LinkedHashSet<>();
@@ -216,7 +234,7 @@ final class Graphs {
 		ReferenceManager rm = p.getReferenceManager();
 		// incoming
 		List<Address> frontier = List.of(address);
-		for (int level = 1; level <= depth && !frontier.isEmpty(); level++) {
+		for (int level = 1; level <= depthIn && !frontier.isEmpty(); level++) {
 			List<Address> next = new ArrayList<>();
 			for (Address a : frontier) {
 				String aid = (String) refNode(p, a, 0).get("id");
@@ -239,7 +257,7 @@ final class Graphs {
 		}
 		// outgoing (from the code unit / data at the address, and its components)
 		frontier = List.of(address);
-		for (int level = 1; level <= depth && !frontier.isEmpty(); level++) {
+		for (int level = 1; level <= depthOut && !frontier.isEmpty(); level++) {
 			List<Address> next = new ArrayList<>();
 			for (Address a : frontier) {
 				String aid = (String) refNode(p, a, 0).get("id");

@@ -29,6 +29,7 @@ final class Engine {
 
     var onEvent: ((String, [String: Any]) -> Void)?
     private(set) var isReady = false
+    var isRunning: Bool { process != nil }
     private(set) var version: String?
 
     private var process: Process?

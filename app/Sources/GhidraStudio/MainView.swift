@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MainView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         @Bindable var model = model
@@ -9,7 +10,7 @@ struct MainView: View {
             SidebarView()
                 .navigationSplitViewColumnWidth(min: 240, ideal: 300, max: 460)
         } detail: {
-            DetailView()
+            DockedDetail { DetailView() }
         }
         .inspector(isPresented: $model.showInspector) {
             InspectorView()
@@ -62,6 +63,15 @@ struct MainView: View {
         .sheet(isPresented: $model.showAnalysisOptions) { AnalysisOptionsSheet() }
         .sheet(isPresented: $model.showExport) { ExportSheet() }
         .sheet(isPresented: $model.showAddBlock) { AddBlockSheet() }
+        .sheet(isPresented: $model.showFunctionEditor) { FunctionEditorSheet() }
+        .sheet(isPresented: $model.showDecompilerOptions) { DecompilerOptionsSheet() }
+        .sheet(item: $model.disassembleRequest) { DisassembleSheet(start: $0.start, end: $0.end) }
+        .sheet(item: $model.unionRequest) { UnionFieldSheet(function: $0.function, token: $0.token) }
+        .onChange(of: model.snapshotRequest) { _, spec in
+            guard let spec else { return }
+            openWindow(id: "snapshot", value: spec)
+            model.snapshotRequest = nil
+        }
     }
 }
 
@@ -152,7 +162,9 @@ struct SidebarView: View {
                     case .imports: importsSection
                     case .exports: exportsSection
                     case .strings: stringsSection
-                    case .segments: segmentsSection
+                    case .segments:
+                        segmentsSection
+                        programTreeSection
                     case .bookmarks: bookmarksSection
                     case .project: EmptyView()
                     }
@@ -314,7 +326,38 @@ struct SidebarView: View {
                         Button((w ? "✓ " : "") + tr("Escritura")) { setPerms(seg, r: r, w: !w, x: x) }
                         Button((x ? "✓ " : "") + tr("Ejecución")) { setPerms(seg, r: r, w: w, x: !x) }
                     }
+                    Menu(tr("Marcas")) {
+                        Button((seg.volatile == true ? "✓ " : "") + tr("Volátil")) {
+                            model.memoryFlag(seg.name, "volatile", seg.volatile == true ? "false" : "true")
+                        }
+                        Button((seg.artificial == true ? "✓ " : "") + tr("Artificial")) {
+                            model.memoryFlag(seg.name, "artificial", seg.artificial == true ? "false" : "true")
+                        }
+                        Button(seg.initialized ? tr("Quitar los bytes (sin inicializar)") : tr("Inicializar con ceros")) {
+                            model.memoryFlag(seg.name, "initialized", seg.initialized ? "false" : "true")
+                        }
+                    }
+                    Button(tr("Comentario del bloque…")) { model.requestBlockComment(seg) }
+                    if seg.overlay == true {
+                        Button(tr("Renombrar el espacio overlay…")) { model.requestRenameOverlay(seg) }
+                    }
                     Button(tr("Añadir bloque…")) { model.showAddBlock = true }
+                    Button(tr("Dividir en…")) {
+                        model.editRequest = EditRequest(kind: .splitBlock(name: seg.name), address: seg.start,
+                                                        title: tr("Dividir bloque"), prompt: tr("Dirección donde empieza el segundo bloque"),
+                                                        initialText: seg.start)
+                    }
+                    Button(tr("Expandir hasta…")) { model.requestExpandBlock(name: seg.name, start: seg.start) }
+                    Button(tr("Mover a…")) {
+                        model.editRequest = EditRequest(kind: .moveBlock(name: seg.name), address: seg.start,
+                                                        title: tr("Mover bloque"), prompt: tr("Nueva dirección inicial"),
+                                                        initialText: seg.start)
+                    }
+                    if let next = model.segments.drop(while: { $0.id != seg.id }).dropFirst().first {
+                        Button(tr("Unir con «%@»", "\(next.name)")) {
+                            model.memoryAction("joinBlocks", ["name": seg.name, "other": next.name])
+                        }
+                    }
                     Divider()
                     Button(tr("Borrar bloque"), role: .destructive) {
                         if model.confirm(tr("¿Borrar el bloque «%@»?", "\(seg.name)"), tr("Se quitará su memoria y lo que contenga."),
@@ -327,12 +370,37 @@ struct SidebarView: View {
         }
     }
 
+    private func flattenTree(_ groups: [TreeGroup], depth: Int = 0) -> [(TreeGroup, Int)] {
+        groups.flatMap { [($0, depth)] + flattenTree($0.children, depth: depth + 1) }
+    }
+
     private func setPerms(_ seg: SegmentItem, r: Bool, w: Bool, x: Bool) {
         model.memoryAction("setBlockPerms", ["name": seg.name, "read": r, "write": w, "execute": x])
     }
 
+    @ViewBuilder private var programTreeSection: some View {
+        if !model.programTree.isEmpty {
+            Section(tr("Árbol del programa")) {
+                ForEach(flattenTree(model.programTree), id: \.0.id) { group, depth in
+                    HStack(spacing: 6) {
+                        Image(systemName: group.module ? "folder" : "doc.text")
+                            .foregroundStyle(group.module ? Color.accentColor : Color.secondary)
+                        Text(group.name).lineLimit(1)
+                        Spacer()
+                        if let start = group.start {
+                            Text(start).font(.caption2.monospaced()).foregroundStyle(.tertiary)
+                        }
+                    }
+                    .padding(.leading, CGFloat(depth) * 12)
+                    .contentShape(Rectangle())
+                    .onTapGesture { if let start = group.start { model.go(start) } }
+                }
+            }
+        }
+    }
+
     @ViewBuilder private var bookmarksSection: some View {
-        let items = model.bookmarks.filter { matches($0.comment) || matches($0.category) || matches($0.address) }
+        let items = model.bookmarks.filter { !$0.isBreakpoint && (matches($0.comment) || matches($0.category) || matches($0.address)) }
         Section(tr("%@ marcadores", "\(items.count)")) {
             if items.isEmpty {
                 Text(tr("Pulsa B en el código para añadir un marcador"))
@@ -373,9 +441,26 @@ struct DetailView: View {
             }
             header
             Divider()
-            ZStack {
-                Color(nsColor: Theme.background)
-                content
+            HStack(spacing: 0) {
+                ZStack {
+                    Color(nsColor: Theme.background)
+                    content
+                }
+                .id(model.themeRevision)
+                if let split = model.splitMode, let session = model.activeSession, let address = model.current?.address {
+                    Divider()
+                    // a second view that follows the main one (listing next to the decompiler, or the reverse)
+                    SnapshotView(spec: SnapshotSpec(session: session, address: address, mode: split), follows: true, embedded: true)
+                        .id("\(session)|\(split)|\(model.themeRevision)")
+                        .frame(minWidth: 320, idealWidth: 520)
+                }
+                if model.listingOptions.showOverview, model.viewMode != .graph, model.document != nil,
+                   let overview = model.overview {
+                    OverviewBar(overview: overview)
+                    if model.listingOptions.showEntropyBar, !model.entropyBar.isEmpty {
+                        EntropyBar(values: model.entropyBar, starts: overview.starts)
+                    }
+                }
             }
             .overlay(alignment: .bottom) {
                 if let analysis = model.analysis {
@@ -385,6 +470,10 @@ struct DetailView: View {
                 }
             }
             .animation(.spring(duration: 0.35), value: model.analysis == nil)
+            if let selection = model.programSelection {
+                Divider()
+                SelectionBar(selection: selection)
+            }
         }
     }
 
@@ -459,7 +548,24 @@ struct DetailView: View {
                 document: document,
                 highlightAddress: model.selectedAddress,
                 scrollRequest: model.scrollRequest,
-                onNavigate: { model.go($0) },
+                sliceTokens: model.viewMode == .decompiler ? model.sliceTokens : [],
+                selection: model.programSelection,
+                breakpoints: model.breakpointMap,
+                pcAddress: model.debugPC,
+                onToggleBreakpoint: model.viewMode == .hex ? nil : { model.toggleBreakpoint(address: $0) },
+                highlight: model.highlight,
+                colors: model.viewMode.isListingLike ? model.colorRanges : [],
+                secondary: model.viewMode == .decompiler ? model.secondaryHighlights : [:],
+                cross: model.crossHighlight,
+                hoverProvider: model.listingOptions.hoverPopups ? { await model.preview($0) } : nil,
+                wordHoverProvider: model.debugger.hasState ? { await model.debugHover($0) } : nil,
+                onNavigate: { target in
+                    if target.hasPrefix(DocumentBuilder.foldPrefix) {
+                        model.toggleFold(String(target.dropFirst(DocumentBuilder.foldPrefix.count)))
+                    } else {
+                        model.go(target)
+                    }
+                },
                 onSelectLine: { model.selectLine($0) },
                 onReachEdge: model.viewMode == .program ? { model.loadMoreFull(atTop: $0) } : nil,
                 onKey: { key, ctx in model.handleKey(key, context: ctx) },
@@ -479,13 +585,97 @@ struct DetailView: View {
         if let v = ctx.variable {
             a.append(.init(title: tr("Renombrar variable «%@»…  (L)", "\(v)"), symbol: "pencil") { model.requestRenameVariable(v) })
             a.append(.init(title: tr("Cambiar tipo de «%@»…  (T)", "\(v)"), symbol: "textformat") { model.requestRetypeVariable(v) })
+            if ctx.canSplit, let token = ctx.tokenID {
+                a.append(.init(title: tr("Dividir como variable nueva…"), symbol: "arrow.triangle.branch") {
+                    model.requestSplitVariable(token: token, name: v)
+                })
+            }
             a.append(.init(title: tr("Crear estructura automáticamente para «%@»", "\(v)"), symbol: "square.grid.3x1.below.line.grid.1x2") {
                 model.autoStructure(v)
             })
             a.append(sep)
         }
+        if ctx.isUnionField, let token = ctx.tokenID, let fn = model.current?.function {
+            a.append(.init(title: tr("Forzar campo de unión…"), symbol: "square.on.square.dashed") {
+                model.unionRequest = UnionRequest(function: fn, token: token)
+            })
+        }
+        if let field = ctx.field {
+            a.append(.init(title: tr("Renombrar campo «%@»…  (L)", "\(ctx.word ?? "")"), symbol: "pencil") {
+                model.requestRenameField(field, currentName: ctx.word)
+            })
+            a.append(sep)
+        }
+        if model.viewMode == .decompiler, let token = ctx.tokenID, ctx.variable != nil || ctx.target != nil {
+            a.append(.init(title: tr("Resaltar de dónde viene (slice hacia atrás)"), symbol: "arrow.up.backward") {
+                model.slice(token, forward: false)
+            })
+            a.append(.init(title: tr("Resaltar a dónde va (slice hacia delante)"), symbol: "arrow.down.forward") {
+                model.slice(token, forward: true)
+            })
+            if !model.sliceTokens.isEmpty {
+                a.append(.init(title: tr("Quitar resaltado"), symbol: "xmark.circle") { model.sliceTokens = [] })
+            }
+            a.append(sep)
+        }
+        if model.viewMode == .decompiler {
+            if let token = ctx.tokenID {
+                a.append(.init(title: tr("Convertir constante…"), symbol: "number") { model.requestConvertConstant(token) })
+                a.append(.init(title: tr("Asignar o quitar equate…"), symbol: "number.circle") { model.requestEquateToken(token) })
+                a.append(.init(title: tr("Editar el tipo de dato"), symbol: "tablecells") { model.editTypeOfToken(token) })
+                a.append(.init(title: tr("Buscar usos del tipo"), symbol: "magnifyingglass") { model.usesOfTokenType(token) })
+                a.append(.init(title: tr("Quitar etiqueta"), symbol: "tag.slash") { model.removeLabelOfToken(token) })
+            }
+            if let field = ctx.field {
+                a.append(.init(title: tr("Cambiar tipo del campo «%@»…", "\(ctx.word ?? "")"), symbol: "textformat") {
+                    model.requestRetypeField(field)
+                })
+            }
+            if let v = ctx.variable {
+                a.append(.init(title: tr("Ajustar offset del puntero «%@»…", v), symbol: "arrow.left.and.right") {
+                    model.requestAdjustPointer(v)
+                })
+                a.append(.init(title: model.taintSources.contains(v) ? tr("Taint: «%@» deja de ser fuente", v) : tr("Taint: marcar «%@» como fuente", v),
+                               symbol: "drop") { model.toggleTaint(v, source: true) })
+                a.append(.init(title: model.taintSinks.contains(v) ? tr("Taint: «%@» deja de ser sumidero", v) : tr("Taint: marcar «%@» como sumidero", v),
+                               symbol: "drop.fill") { model.toggleTaint(v, source: false) })
+            } else if ctx.callSite != nil, let name = ctx.targetText {
+                a.append(.init(title: model.taintSinks.contains(name) ? tr("Taint: «%@» deja de ser sumidero", name) : tr("Taint: marcar «%@» como sumidero", name),
+                               symbol: "drop.fill") { model.toggleTaint(name, source: false) })
+            }
+            if !model.taintSources.isEmpty {
+                a.append(.init(title: tr("Taint: ejecutar la consulta"), symbol: "play") { model.runTaint() })
+                a.append(.init(title: tr("Taint: borrar marcas"), symbol: "xmark.circle") { model.clearTaint() })
+            }
+            if let word = ctx.word ?? ctx.variable {
+                a.append(.init(title: model.secondaryHighlights[word] == nil ? tr("Resaltado secundario de «%@»", word)
+                               : tr("Quitar el resaltado secundario de «%@»", word), symbol: "highlighter") {
+                    model.toggleSecondary(word)
+                })
+            }
+            if !model.secondaryHighlights.isEmpty {
+                a.append(.init(title: tr("Quitar todos los resaltados secundarios"), symbol: "xmark.circle") {
+                    model.secondaryHighlights = [:]
+                })
+            }
+            a.append(.init(title: tr("Cambiar tipo de retorno…"), symbol: "arrow.uturn.left") { model.requestRetypeReturn() })
+            a.append(.init(title: tr("Exportar esta función a C…"), symbol: "square.and.arrow.up") { model.exportFunctionC() })
+            a.append(.init(title: tr("Depurar la descompilación de esta función…"), symbol: "ant") { model.debugDecompile() })
+            a.append(sep)
+        }
+        if let call = ctx.callSite {
+            a.append(.init(title: tr("Forzar firma en esta llamada…"), symbol: "function") {
+                model.requestOverrideSignature(callSite: call, name: ctx.targetText)
+            })
+        }
         if let target = ctx.target {
             let name = ctx.targetText ?? target
+            if model.viewMode == .decompiler, ctx.callSite == nil, ctx.variable == nil,
+               !model.functions.contains(where: { $0.address == target }) {
+                a.append(.init(title: tr("Cambiar tipo del global «%@»…", "\(name)"), symbol: "textformat") {
+                    model.requestRetypeGlobal(address: target, name: name)
+                })
+            }
             a.append(.init(title: tr("Ir a %@", "\(name)"), symbol: "arrow.right.circle") { model.go(target) })
             a.append(.init(title: tr("Renombrar «%@»…", "\(name)"), symbol: "pencil") {
                 model.requestRename(address: target, currentName: name)
@@ -494,14 +684,38 @@ struct DetailView: View {
             a.append(sep)
         }
         if model.viewMode == .decompiler, model.functionDetails != nil {
+            a.append(.init(title: tr("Editar función (convención, pila, etiquetas)…"), symbol: "slider.horizontal.3") {
+                model.showFunctionEditor = true
+            })
             a.append(.init(title: tr("Editar firma de la función…"), symbol: "function") { model.requestSignature() })
             a.append(.init(title: tr("Comentario de la función…"), symbol: "text.bubble") { model.requestFunctionComment() })
         }
         guard let line = ctx.lineAddress else { return a }
+        if model.viewMode.isListingLike, let start = ctx.selectionStart, let end = ctx.selectionEnd, start != end {
+            a.append(.init(title: tr("Desensamblar la selección (%@ – %@)", "\(start)", "\(end)"), symbol: "cpu") {
+                model.rangeAction("disassembleRange", start: start, end: end)
+            })
+            a.append(.init(title: tr("Borrar código/datos de la selección"), symbol: "eraser") {
+                model.rangeAction("clearRange", start: start, end: end)
+            })
+            a.append(.init(title: tr("Crear estructura desde la selección…"), symbol: "square.grid.3x1.below.line.grid.1x2") {
+                model.requestStructFromRange(start: start, end: end)
+            })
+            a.append(.init(title: tr("Definir cadena en la selección"), symbol: "textformat.abc") {
+                model.defineString(address: start, end: end)
+            })
+            a.append(.init(title: tr("Fijar registro en la selección…"), symbol: "memorychip") {
+                model.requestSetRegister(start: start, end: end)
+            })
+            a.append(sep)
+        }
         if model.viewMode.isListingLike || model.viewMode == .hex {
             if model.viewMode.isListingLike {
                 a.append(.init(title: tr("Desensamblar  (D)"), symbol: "cpu") {
                     model.perform("disassemble", address: line, namesChanged: false)
+                })
+                a.append(.init(title: tr("Desensamblar con opciones…"), symbol: "cpu") {
+                    model.requestDisassembleOptions(start: ctx.selectionStart ?? line, end: ctx.selectionEnd)
                 })
                 a.append(.init(title: tr("Crear función aquí…  (F)"), symbol: "f.cursive") { model.requestCreateFunction(address: line) })
                 a.append(.init(title: tr("Definir dato…  (T)"), symbol: "tablecells") { model.requestCreateData(address: line) })
@@ -510,10 +724,55 @@ struct DetailView: View {
                 })
                 a.append(sep)
                 a.append(.init(title: tr("Ensamblar instrucción…"), symbol: "hammer") { model.requestAssemble(address: line) })
+                a.append(.init(title: tr("Ensamblador con comodines…"), symbol: "asterisk.circle") {
+                    model.selectLine(line)
+                    model.showTools("wildAsm")
+                })
                 a.append(.init(title: tr("Nombre para constante (equate)…"), symbol: "number.circle") { model.requestEquate(address: line) })
                 a.append(.init(title: tr("Añadir referencia…"), symbol: "arrow.turn.down.right") { model.requestAddReference(address: line) })
+                a.append(.init(title: tr("Crear array…"), symbol: "square.grid.3x3") { model.requestArray(address: line) })
+                a.append(.init(title: tr("Definir cadena aquí"), symbol: "textformat.abc") { model.defineString(address: line, end: nil) })
+                a.append(.init(title: tr("Fijar valor de registro (p. ej. modo Thumb)…"), symbol: "memorychip") {
+                    model.requestSetRegister(start: line, end: nil)
+                })
+                a.append(.init(title: tr("Abrir o cerrar la estructura o el array"), symbol: "chevron.down.square") {
+                    model.toggleData(line)
+                })
+                a.append(.init(title: tr("Editar el campo de la estructura…"), symbol: "rectangle.and.pencil.and.ellipsis") {
+                    model.requestEditField(address: line)
+                })
+                if let last = model.recentTypes.first {
+                    a.append(.init(title: tr("Aplicar el tipo %@  (Y)", last), symbol: "clock.arrow.circlepath") {
+                        model.applyType(last, address: line)
+                    })
+                }
+                a.append(.init(title: tr("Plegar o desplegar la función"), symbol: "chevron.right.square") {
+                    model.foldCurrentFunction()
+                })
+                a.append(.init(title: tr("Referencias de esta línea…"), symbol: "arrow.turn.down.right") {
+                    model.selectLine(line)
+                    model.showTools("references")
+                })
+                a.append(.init(title: tr("Etiquetas e historial…"), symbol: "tag") {
+                    model.selectLine(line)
+                    model.showTools("labels")
+                })
+                a.append(.init(title: tr("Información de la instrucción…"), symbol: "info.circle") {
+                    model.selectLine(line)
+                    model.showTools("instruction")
+                })
+                a.append(.init(title: tr("Ajustes del dato…"), symbol: "slider.horizontal.3") {
+                    model.selectLine(line)
+                    model.showTools("data")
+                })
+                a.append(.init(title: tr("Borrar con opciones…"), symbol: "eraser.line.dashed") { model.requestClearWithOptions() })
+                for (title, format) in [("hexadecimal", "hex"), ("decimal", "decimal"), (tr("binario"), "binary"), (tr("carácter"), "char")] {
+                    a.append(.init(title: tr("Mostrar el dato en %@", "\(title)"), symbol: "number") { model.setDataFormat(format, address: line) })
+                }
             }
             a.append(.init(title: tr("Parchear bytes…"), symbol: "bandage") { model.requestPatch(address: line) })
+            a.append(.init(title: tr("Escribir texto…"), symbol: "character.cursor.ibeam") { model.requestPatchText(address: line) })
+            a.append(.init(title: tr("Escribir entero…"), symbol: "number") { model.requestPatchInt(address: line) })
             a.append(sep)
         }
         a.append(.init(title: tr("Añadir etiqueta en %@…", "\(line)"), symbol: "tag") { model.requestLabel(address: line) })
@@ -525,6 +784,42 @@ struct DetailView: View {
             model.requestComment(address: line, kind: "plate")
         })
         a.append(.init(title: tr("Añadir marcador…  (B)"), symbol: "bookmark") { model.requestBookmark(address: line) })
+        a.append(sep)
+        if model.viewMode != .hex {
+            if let enabled = model.breakpointMap[line] {
+                a.append(.init(title: tr("Quitar breakpoint  (K)"), symbol: "circle.slash") {
+                    model.setBreakpoint(address: line, state: "none")
+                })
+                a.append(.init(title: enabled ? tr("Desactivar breakpoint") : tr("Activar breakpoint"), symbol: "circle.dotted") {
+                    model.setBreakpoint(address: line, state: enabled ? "disabled" : "enabled")
+                })
+            } else {
+                a.append(.init(title: tr("Poner breakpoint  (K)"), symbol: "circle.fill") {
+                    model.setBreakpoint(address: line, state: "enabled")
+                })
+            }
+            if model.debugger.isStopped {
+                a.append(.init(title: tr("Ejecutar hasta aquí"), symbol: "arrow.right.to.line") {
+                    model.debugger.run(toStatic: line)
+                })
+            }
+            a.append(sep)
+        }
+        if let start = ctx.selectionStart, let end = ctx.selectionEnd, start != end {
+            a.append(.init(title: tr("Seleccionar estas líneas"), symbol: "rectangle.dashed") {
+                model.selectLines(start: start, end: end)
+            })
+        }
+        a.append(.init(title: tr("Seleccionar la función"), symbol: "rectangle.dashed") { model.select("function") })
+        a.append(.init(title: tr("Seleccionar todo el flujo desde aquí"), symbol: "arrow.down.right") { model.select("flowFrom") })
+        a.append(.init(title: tr("Seleccionar todo el flujo hasta aquí"), symbol: "arrow.up.left") { model.select("flowTo") })
+        if model.programSelection != nil {
+            a.append(.init(title: tr("Quitar la selección"), symbol: "xmark.circle") { model.clearProgramSelection() })
+        }
+        a.append(.init(title: tr("Abrir en una ventana nueva"), symbol: "macwindow.badge.plus") {
+            model.snapshotRequest = SnapshotSpec(session: model.activeSession ?? "", address: line,
+                                                 mode: model.viewMode == .decompiler ? "decompiler" : "listing")
+        })
         a.append(sep)
         if ctx.target == nil {
             a.append(.init(title: tr("Copiar dirección %@", "\(line)"), symbol: "number") { model.copyToPasteboard(line) })

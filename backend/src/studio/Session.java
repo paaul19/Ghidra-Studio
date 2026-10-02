@@ -42,22 +42,29 @@ final class Session {
 	private final Object consumer;
 	private DecompInterface decompiler;
 	private final Map<Address, Map<String, Object>> decompCache = new ConcurrentHashMap<>();
+	/** Tokens of each cached decompilation, indexed by the "i" id sent to the UI (for slicing etc.). */
+	private final Map<Address, List<ClangToken>> tokenCache = new ConcurrentHashMap<>();
+	private final DecompileOptions decompOptions = new DecompileOptions();
 	private volatile Thread analysisThread;
 	private volatile ProgressMonitor analysisMonitor;
 	private long lastProgress;
 	final Emulation emulation = new Emulation(this);
 
 	Session(StudioServer server, Program program, Object consumer, String sourcePath) throws IOException {
+		this(server, program, consumer, sourcePath, null);
+	}
+
+	/** id: what identifies the session when it is not the file's path (an old version of a file). */
+	Session(StudioServer server, Program program, Object consumer, String sourcePath, String id) throws IOException {
 		this.server = server;
 		this.program = program;
 		this.consumer = consumer;
 		DomainFile df = program.getDomainFile();
-		this.id = df != null ? df.getPathname() : program.getName();
+		this.id = id != null ? id : df != null ? df.getPathname() : program.getName();
 		this.sourcePath = sourcePath != null ? sourcePath : program.getExecutablePath();
 		decompiler = new DecompInterface();
-		DecompileOptions opts = new DecompileOptions();
-		opts.grabFromProgram(program);
-		decompiler.setOptions(opts);
+		decompOptions.grabFromProgram(program);
+		decompiler.setOptions(decompOptions);
 		decompiler.toggleCCode(true);
 		decompiler.toggleSyntaxTree(true);
 		decompiler.setSimplificationStyle("decompile");
@@ -139,6 +146,12 @@ final class Session {
 	}
 
 	void save() throws IOException {
+		if (!program.canSave()) {
+			if (program.isChanged()) {
+				throw new IOException("El programa es de solo lectura: haz check-out para poder guardar los cambios");
+			}
+			return;
+		}
 		if (!isAnalyzing() && program.isChanged()) {
 			try {
 				program.save("Ghidra Studio", TaskMonitor.DUMMY);
@@ -149,16 +162,61 @@ final class Session {
 		}
 	}
 
+	/** Writes a recovery snapshot of the unsaved changes (used to recover after a crash). */
+	boolean snapshot() {
+		DomainFile df = program.getDomainFile();
+		if (df == null || !program.isChanged() || !program.canSave() || isAnalyzing()) {
+			return false;
+		}
+		// DomainFile.takeRecoverySnapshot() does nothing in headless mode, so do what it does by hand:
+		// lock out transactions and let the database write its snapshot files.
+		if (!(program instanceof ghidra.program.database.ProgramDB db) || !db.lock("Recovery snapshot")) {
+			return false;
+		}
+		try {
+			return db.getDBHandle().takeRecoverySnapshot(db.getChangeSet(), TaskMonitor.DUMMY);
+		}
+		catch (Exception e) {
+			e.printStackTrace();
+			return false;
+		}
+		finally {
+			db.unlock();
+		}
+	}
+
+	/** Starts a transaction, waiting a moment if a recovery snapshot holds the lock. */
+	private int begin(String name) throws InterruptedException {
+		for (int i = 0;; i++) {
+			try {
+				return program.startTransaction(name);
+			}
+			catch (ghidra.framework.model.DomainObjectLockedException e) {
+				if (i >= 100) {
+					throw e;
+				}
+				Thread.sleep(50);
+			}
+		}
+	}
+
+	/** What else has to be released with the program (the connection a server URL was opened through). */
+	Runnable afterClose;
+
 	void close() {
+		close(true);
+	}
+
+	void close(boolean save) {
 		emulation.stop();
 		cancelAnalysis();
-		decompCache.clear();
+		invalidate();
 		if (decompiler != null) {
 			decompiler.dispose();
 			decompiler = null;
 		}
 		try {
-			if (program.isChanged()) {
+			if (save && program.isChanged() && program.canSave()) {
 				program.save("Ghidra Studio", TaskMonitor.DUMMY);
 			}
 		}
@@ -171,15 +229,25 @@ final class Session {
 		catch (Exception ignored) {
 			// already released
 		}
+		if (afterClose != null) {
+			try {
+				afterClose.run();
+			}
+			catch (Exception ignored) {
+				// the connection may already be gone
+			}
+			afterClose = null;
+		}
 	}
 
 	void invalidate() {
 		decompCache.clear();
+		tokenCache.clear();
 	}
 
 	/** Runs an edit inside a transaction (undoable; saved explicitly like the CodeBrowser). */
 	<T> T edit(String name, Callable<T> body) throws Exception {
-		int tx = program.startTransaction(name);
+		int tx = begin(name);
 		boolean ok = false;
 		T result;
 		try {
@@ -225,6 +293,7 @@ final class Session {
 		Function entry = firstEntryFunction();
 		m.put("entry", entry != null ? str(entry.getEntryPoint()) : null);
 		m.put("analyzing", isAnalyzing());
+		m.put("readOnly", !program.canSave());
 		m.putAll(undoState());
 		return m;
 	}
@@ -325,7 +394,8 @@ final class Session {
 		List<Map<String, Object>> list = new ArrayList<>();
 		for (MemoryBlock b : program.getMemory().getBlocks()) {
 			list.add(map("name", b.getName(), "start", str(b.getStart()), "end", str(b.getEnd()),
-				"size", b.getSize(), "perms", perms(b), "initialized", b.isInitialized(), "comment", b.getComment()));
+				"size", b.getSize(), "perms", perms(b), "initialized", b.isInitialized(), "comment", b.getComment(),
+				"volatile", b.isVolatile(), "artificial", b.isArtificial(), "overlay", b.isOverlay()));
 		}
 		return list;
 	}
@@ -350,9 +420,21 @@ final class Session {
 
 	List<Map<String, Object>> bookmarks() {
 		List<Map<String, Object>> list = new ArrayList<>();
+		// breakpoints first, so that a program full of analysis bookmarks never crowds them out
+		for (String type : List.of(Debug.ENABLED, Debug.DISABLED)) {
+			Iterator<Bookmark> marks = program.getBookmarkManager().getBookmarksIterator(type);
+			while (marks.hasNext()) {
+				Bookmark b = marks.next();
+				list.add(map("address", str(b.getAddress()), "type", b.getTypeString(), "category", b.getCategory(),
+					"comment", b.getComment()));
+			}
+		}
 		Iterator<Bookmark> it = program.getBookmarkManager().getBookmarksIterator();
 		while (it.hasNext() && list.size() < 5000) {
 			Bookmark b = it.next();
+			if (Debug.isBreakpoint(b)) {
+				continue;
+			}
 			list.add(map("address", str(b.getAddress()), "type", b.getTypeString(), "category", b.getCategory(),
 				"comment", b.getComment()));
 		}
@@ -361,7 +443,7 @@ final class Session {
 
 	// ---------------------------------------------------------------- decompiler
 
-	private DecompileResults decompileRaw(Function f) {
+	DecompileResults decompileRaw(Function f) {
 		DecompileResults res = decompiler.decompileFunction(f, 60, TaskMonitor.DUMMY);
 		if (!res.decompileCompleted()) {
 			throw new IllegalStateException("Error al descompilar: " + res.getErrorMessage());
@@ -385,9 +467,11 @@ final class Session {
 		}
 		DecompileResults res = decompileRaw(f);
 		List<Map<String, Object>> lines = new ArrayList<>();
+		List<ClangToken> all = new ArrayList<>();
 		for (ClangLine line : DecompilerUtils.toLines(res.getCCodeMarkup())) {
 			List<Map<String, Object>> tokens = new ArrayList<>();
 			Address lineAddr = null;
+			Set<String> lineAddrs = new LinkedHashSet<>();
 			for (ClangToken t : line.getAllTokens()) {
 				String text = t.getText();
 				if (text == null || text.isEmpty()) {
@@ -405,18 +489,254 @@ final class Session {
 				if (var != null) {
 					tm.put("v", var);
 				}
+				tm.put("i", all.size());
+				all.add(t);
+				if (canSplit(t)) {
+					tm.put("sp", true);
+				}
+				if (More.isUnionField(t)) {
+					tm.put("un", true);
+				}
+				if (t instanceof ClangFieldToken ft && ft.getDataType() != null) {
+					DataType owner = ft.getDataType();
+					if (owner instanceof TypeDef td) {
+						owner = td.getBaseDataType();
+					}
+					tm.put("ft", owner.getPathName());
+					tm.put("fo", ft.getOffset());
+				}
+				if (t instanceof ClangFuncNameToken fn && fn.getPcodeOp() != null
+						&& (fn.getPcodeOp().getOpcode() == PcodeOp.CALL || fn.getPcodeOp().getOpcode() == PcodeOp.CALLIND)) {
+					tm.put("call", str(fn.getPcodeOp().getSeqnum().getTarget()));
+				}
 				tokens.add(tm);
 				Address min = t.getMinAddress();
 				if (min != null && (lineAddr == null || min.compareTo(lineAddr) < 0)) {
 					lineAddr = min;
 				}
+				if (min != null && lineAddrs.size() < 24) {
+					lineAddrs.add(str(min));
+				}
 			}
-			lines.add(map("indent", line.getIndent(), "tokens", tokens, "addr", lineAddr != null ? str(lineAddr) : null));
+			Map<String, Object> lm = map("indent", line.getIndent(), "tokens", tokens, "addr", lineAddr != null ? str(lineAddr) : null);
+			if (lineAddrs.size() > 1) {
+				lm.put("addrs", new ArrayList<>(lineAddrs));
+			}
+			lines.add(lm);
 		}
 		Map<String, Object> m = map("function", f.getName(true), "entry", str(f.getEntryPoint()),
 			"signature", f.getPrototypeString(false, false), "lines", lines);
 		decompCache.put(f.getEntryPoint(), m);
+		tokenCache.put(f.getEntryPoint(), all);
 		return m;
+	}
+
+	ClangToken token(Address fnAddr, int tokenId) {
+		Function f = functionContaining(fnAddr);
+		decompile(f.getEntryPoint());
+		List<ClangToken> all = tokenCache.get(f.getEntryPoint());
+		if (all == null || tokenId < 0 || tokenId >= all.size()) {
+			throw new IllegalArgumentException("Token desconocido");
+		}
+		return all.get(tokenId);
+	}
+
+	HighFunction highFunction(Address fnAddr) {
+		HighFunction hf = decompileRaw(functionContaining(fnAddr)).getHighFunction();
+		if (hf == null) {
+			throw new IllegalStateException("Error al descompilar: " + fnAddr);
+		}
+		return hf;
+	}
+
+	/** Same test as the decompiler's "Split Out As New Variable": the variable merges several storage groups. */
+	private static boolean canSplit(ClangToken t) {
+		if (!(t instanceof ClangVariableToken)) {
+			return false;
+		}
+		HighVariable variable = t.getHighVariable();
+		if (!(variable instanceof HighLocal) || variable.getSymbol() == null || variable.getSymbol().isIsolated()) {
+			return false;
+		}
+		Varnode vn = t.getVarnode();
+		if (vn == null) {
+			return false;
+		}
+		short group = vn.getMergeGroup();
+		for (Varnode v : variable.getInstances()) {
+			if (v.getMergeGroup() != group) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Splits the instance under the cursor out of a merged variable into its own, newly named, variable. */
+	Object splitVariable(Address fnAddr, int tokenId, String newName) throws Exception {
+		Function f = functionContaining(fnAddr);
+		decompile(f.getEntryPoint());
+		List<ClangToken> all = tokenCache.get(f.getEntryPoint());
+		if (all == null || tokenId < 0 || tokenId >= all.size()) {
+			throw new IllegalArgumentException("Token desconocido");
+		}
+		ClangToken t = all.get(tokenId);
+		if (!canSplit(t)) {
+			throw new IllegalArgumentException("Esta variable no se puede dividir: no agrupa varios usos distintos");
+		}
+		Varnode vn = t.getVarnode();
+		HighFunction hf = t.getHighVariable().getSymbol().getHighFunction();
+		for (Symbol sym : program.getSymbolTable().getSymbols(f)) {
+			if (sym.getName().equals(newName)) {
+				throw new IllegalArgumentException("Ya existe una variable con ese nombre en la función");
+			}
+		}
+		edit("Dividir variable", () -> {
+			HighVariable split = hf.splitOutMergeGroup(vn.getHigh(), vn);
+			HighSymbol sym = split.getSymbol();
+			DataType dt = sym.getDataType();
+			if (Undefined.isUndefined(dt)) {
+				// the new variable has to be type-locked, and an undefined type cannot be
+				dt = AbstractIntegerDataType.getUnsignedDataType(dt.getLength(), program.getDataTypeManager());
+			}
+			HighFunctionDBUtil.updateDBVariable(sym, newName, dt, SourceType.USER_DEFINED);
+			return null;
+		});
+		return undoState();
+	}
+
+	/** Forward / backward data-flow slice from a token: returns the ids of the tokens to highlight. */
+	List<Integer> slice(Address fnAddr, int tokenId, boolean forward) {
+		Function f = functionContaining(fnAddr);
+		decompile(f.getEntryPoint());
+		List<ClangToken> all = tokenCache.get(f.getEntryPoint());
+		if (all == null || tokenId < 0 || tokenId >= all.size()) {
+			throw new IllegalArgumentException("Token desconocido");
+		}
+		Varnode vn = DecompilerUtils.getVarnodeRef(all.get(tokenId));
+		if (vn == null) {
+			throw new IllegalArgumentException("Coloca el cursor sobre una variable");
+		}
+		Set<PcodeOp> ops = forward ? DecompilerUtils.getForwardSliceToPCodeOps(vn)
+				: DecompilerUtils.getBackwardSliceToPCodeOps(vn);
+		Set<Varnode> vars = forward ? DecompilerUtils.getForwardSlice(vn) : DecompilerUtils.getBackwardSlice(vn);
+		List<Integer> out = new ArrayList<>();
+		for (int i = 0; i < all.size(); i++) {
+			ClangToken t = all.get(i);
+			if (!(t instanceof ClangVariableToken) && !(t instanceof ClangOpToken) && !(t instanceof ClangFuncNameToken)) {
+				continue;
+			}
+			Varnode v = DecompilerUtils.getVarnodeRef(t);
+			PcodeOp op = t.getPcodeOp();
+			if ((v != null && vars.contains(v)) || (op != null && ops.contains(op))) {
+				out.add(i);
+			}
+		}
+		return out;
+	}
+
+	Object renameField(String typePath, int offset, String name) throws Exception {
+		DataType dt = Types.find(program, typePath);
+		if (dt instanceof Pointer ptr) {
+			dt = ptr.getDataType();
+		}
+		if (!(dt instanceof Composite c)) {
+			throw new IllegalArgumentException("No es una estructura: " + typePath);
+		}
+		return edit("Renombrar campo", () -> {
+			DataTypeComponent comp = c instanceof Structure st ? st.getComponentContaining(offset) : c.getComponent(offset);
+			if (comp == null) {
+				throw new IllegalArgumentException("No hay ningún campo en el offset " + offset);
+			}
+			if (comp.getDataType() == DataType.DEFAULT && c instanceof Structure st) {
+				st.replaceAtOffset(offset, Undefined1DataType.dataType, 1, name, null);
+			}
+			else {
+				comp.setFieldName(name);
+			}
+			return true;
+		});
+	}
+
+	/** Like "Override Signature": forces the prototype used at one call site. */
+	Object overrideSignature(Address fnAddr, Address callSite, String signature) throws Exception {
+		Function f = functionContaining(fnAddr);
+		FunctionSignatureParser parser = new FunctionSignatureParser(program.getDataTypeManager(),
+			new Types.QueryService(program));
+		FunctionDefinitionDataType def = parser.parse(null, signature);
+		return edit("Forzar firma", () -> {
+			HighFunctionDBUtil.writeOverride(f, callSite, def);
+			return true;
+		});
+	}
+
+	// ---------------------------------------------------------------- decompiler options
+
+	private static final String[][] DECOMP_OPTIONS = {
+		{ "MaxWidth", "int", "Ancho máximo de línea" },
+		{ "IndentWidth", "int", "Ancho de sangría" },
+		{ "EliminateUnreachable", "bool", "Eliminar código inalcanzable" },
+		{ "SimplifyDoublePrecision", "bool", "Simplificar aritmética de doble precisión" },
+		{ "NoCastPrint", "bool", "Ocultar conversiones de tipo (casts)" },
+		{ "ConventionPrint", "bool", "Mostrar la convención de llamada" },
+		{ "InferConstantPointers", "bool", "Inferir punteros a partir de constantes" },
+		{ "AnalyzeForLoops", "bool", "Reconstruir bucles for" },
+		{ "RespectReadOnly", "bool", "Respetar memoria de solo lectura" },
+		{ "PRECommentIncluded", "bool", "Mostrar comentarios previos" },
+		{ "PLATECommentIncluded", "bool", "Mostrar comentarios de cabecera" },
+		{ "EOLCommentIncluded", "bool", "Mostrar comentarios de fin de línea" },
+		{ "POSTCommentIncluded", "bool", "Mostrar comentarios posteriores" },
+		{ "WARNCommentIncluded", "bool", "Mostrar avisos del descompilador" },
+		{ "HeadCommentIncluded", "bool", "Mostrar comentario de la función" },
+		{ "IntegerFormat", "enum", "Formato de los enteros" },
+		{ "NamespaceStrategy", "enum", "Mostrar namespaces" },
+		{ "CommentStyle", "enum", "Estilo de los comentarios" },
+	};
+
+	private java.lang.reflect.Method getter(String name) throws NoSuchMethodException {
+		for (String prefix : new String[] { "get", "is" }) {
+			try {
+				return DecompileOptions.class.getMethod(prefix + name);
+			}
+			catch (NoSuchMethodException ignored) {
+				// try next
+			}
+		}
+		throw new NoSuchMethodException(name);
+	}
+
+	List<Map<String, Object>> decompilerOptions() {
+		List<Map<String, Object>> out = new ArrayList<>();
+		for (String[] o : DECOMP_OPTIONS) {
+			try {
+				Object value = getter(o[0]).invoke(decompOptions);
+				Map<String, Object> m = map("key", o[0], "type", o[1], "label", Msg.t(o[2]), "value", String.valueOf(value));
+				if (value != null && value.getClass().isEnum()) {
+					List<String> choices = new ArrayList<>();
+					for (Object c : value.getClass().getEnumConstants()) {
+						choices.add(((java.lang.Enum<?>) c).name());
+					}
+					m.put("choices", choices);
+					m.put("value", ((java.lang.Enum<?>) value).name());
+				}
+				out.add(m);
+			}
+			catch (Exception ignored) {
+				// option not available in this Ghidra version
+			}
+		}
+		return out;
+	}
+
+	@SuppressWarnings({ "unchecked", "rawtypes" })
+	Object setDecompilerOption(String key, String value) throws Exception {
+		Class<?> type = getter(key).getReturnType();
+		Object arg = type == int.class ? (Object) Integer.parseInt(value.trim())
+				: type == boolean.class ? (Object) Boolean.parseBoolean(value)
+				: type.isEnum() ? java.lang.Enum.valueOf((Class) type, value) : value;
+		DecompileOptions.class.getMethod("set" + key, type).invoke(decompOptions, arg);
+		decompiler.setOptions(decompOptions);
+		invalidate();
+		return true;
 	}
 
 	private static String tokenKind(ClangToken t) {
@@ -443,7 +763,7 @@ final class Session {
 		return hs != null ? hs.getName() : null;
 	}
 
-	private Address tokenTarget(ClangToken t) {
+	Address tokenTarget(ClangToken t) {
 		if (t instanceof ClangFuncNameToken fn) {
 			PcodeOp op = fn.getPcodeOp();
 			if (op != null && op.getOpcode() == PcodeOp.CALL && op.getInput(0) != null) {
@@ -496,8 +816,12 @@ final class Session {
 			"signature", f != null ? f.getPrototypeString(false, false) : null, "rows", rows);
 	}
 
-	/** A contiguous slice of the whole-program listing, used for infinite scrolling. */
-	Map<String, Object> listingSpan(Address address, String direction, int count, boolean inclusive) {
+	/**
+	 * A contiguous slice of the whole-program listing, used for infinite scrolling. Functions whose entry
+	 * is in {@code collapsed} are folded: only their first line is sent, with how much is hidden.
+	 */
+	Map<String, Object> listingSpan(Address address, String direction, int count, boolean inclusive,
+			Set<String> collapsed) {
 		count = Math.max(1, Math.min(count, 5000));
 		Listing listing = program.getListing();
 		CodeUnit containing = listing.getCodeUnitContaining(address);
@@ -506,18 +830,117 @@ final class Session {
 		CodeUnitIterator it = listing.getCodeUnits(start, forward);
 		RowContext ctx = new RowContext();
 		List<Map<String, Object>> rows = new ArrayList<>();
+		int jumps = 0;
 		while (it.hasNext() && rows.size() < count) {
 			CodeUnit cu = it.next();
-			if (!inclusive && cu.getAddress().equals(start)) {
+			Address a = cu.getAddress();
+			if (!inclusive && a.equals(start)) {
 				continue;
 			}
-			rows.add(row(cu, ctx, true));
+			Function folded = null;
+			if (!collapsed.isEmpty()) {
+				Function f = ctx.fm.getFunctionContaining(a);
+				if (f != null && collapsed.contains(str(f.getEntryPoint()))) {
+					folded = f;
+				}
+			}
+			if (folded != null && !a.equals(folded.getEntryPoint())) {
+				// inside a folded function: jump over this piece of its body
+				ghidra.program.model.address.AddressRange range = folded.getBody().getRangeContaining(a);
+				Address next = null;
+				if (range != null && jumps++ < 100000) {
+					if (forward) {
+						next = range.getMaxAddress().next();
+					}
+					else {
+						next = range.contains(folded.getEntryPoint()) ? folded.getEntryPoint()
+								: range.getMinAddress().previous();
+					}
+				}
+				if (next != null) {
+					it = listing.getCodeUnits(next, forward);
+				}
+				continue;
+			}
+			Map<String, Object> r = row(cu, ctx, true);
+			if (folded != null) {
+				r.put("folded", folded.getBody().getNumAddresses());
+			}
+			rows.add(r);
 		}
 		boolean atEdge = !it.hasNext();
 		if (!forward) {
 			Collections.reverse(rows);
 		}
 		return map("rows", rows, "atEdge", atEdge);
+	}
+
+	/** Optional listing fields the interface asked for: fileOffset, functionOffset, pcode, xrefs, source. */
+	volatile Set<String> listingFields = Set.of();
+
+	private void extraFields(CodeUnit cu, Address a, RowContext ctx, Map<String, Object> r) {
+		Set<String> fields = listingFields;
+		if (fields.contains("fileOffset")) {
+			ghidra.program.database.mem.AddressSourceInfo info = program.getMemory().getAddressSourceInfo(a);
+			if (info != null && info.getFileOffset() >= 0) {
+				r.put("fileOffset", Long.toHexString(info.getFileOffset()));
+			}
+		}
+		if (fields.contains("functionOffset")) {
+			Function f = ctx.fm.getFunctionContaining(a);
+			if (f != null) {
+				r.put("functionOffset", f.getName() + "+0x" + Long.toHexString(a.subtract(f.getEntryPoint())));
+			}
+		}
+		if (fields.contains("pcode") && cu instanceof Instruction ins) {
+			List<String> ops = new ArrayList<>();
+			for (ghidra.program.model.pcode.PcodeOp op : ins.getPcode()) {
+				ops.add(op.toString());
+			}
+			r.put("pcode", ops);
+		}
+		if (fields.contains("xrefs")) {
+			List<String> list = new ArrayList<>();
+			ReferenceIterator it = ctx.rm.getReferencesTo(a);
+			while (it.hasNext() && list.size() < 6) {
+				Reference ref = it.next();
+				list.add(str(ref.getFromAddress()) + "(" + ref.getReferenceType().getDisplayString() + ")");
+			}
+			if (fields.contains("thunkXrefs")) {
+				int extra = 0;
+				for (Address thunk : thunksOf(a)) {
+					ReferenceIterator ti = ctx.rm.getReferencesTo(thunk);
+					while (ti.hasNext()) {
+						Reference ref = ti.next();
+						extra++;
+						if (list.size() < 6) {
+							list.add(str(ref.getFromAddress()) + "(" + ref.getReferenceType().getDisplayString() + " thunk)");
+						}
+					}
+				}
+				if (extra > 0) {
+					r.put("thunkXrefs", extra);
+				}
+			}
+			if (!list.isEmpty()) {
+				r.put("xrefList", list);
+			}
+		}
+		if (fields.contains("source")) {
+			List<ghidra.program.model.sourcemap.SourceMapEntry> entries =
+				program.getSourceFileManager().getSourceMapEntries(a);
+			if (!entries.isEmpty()) {
+				ghidra.program.model.sourcemap.SourceMapEntry e = entries.get(0);
+				r.put("source", e.getSourceFile().getFilename() + ":" + e.getLineNumber());
+			}
+		}
+	}
+
+	/** Entry points of the thunks that end in the function at this address. */
+	List<Address> thunksOf(Address a) {
+		Function f = program.getFunctionManager().getFunctionAt(a);
+		Address[] thunks = f == null ? null : f.getFunctionThunkAddresses(true);
+		return thunks == null ? List.of() : Arrays.asList(thunks);
 	}
 
 	private class RowContext {
@@ -560,6 +983,16 @@ final class Session {
 			r.put("flow", ins.getFlowType().isCall() ? "call"
 					: ins.getFlowType().isTerminal() ? "return"
 					: ins.getFlowType().isJump() ? "jump" : null);
+			if (ins.getFlowType().isJump()) {
+				List<String> jumps = new ArrayList<>();
+				for (Address target : ins.getFlows()) {
+					jumps.add(str(target));
+				}
+				if (!jumps.isEmpty()) {
+					r.put("jumps", jumps);
+					r.put("conditional", ins.getFlowType().isConditional());
+				}
+			}
 		}
 		else if (cu instanceof Data d) {
 			r.put("kind", d.isDefined() ? "data" : "undefined");
@@ -578,9 +1011,18 @@ final class Session {
 		r.put("post", cu.getComment(CommentType.POST));
 		r.put("repeatable", cu.getComment(CommentType.REPEATABLE));
 		r.put("xrefs", ctx.rm.getReferenceCountTo(a));
-		Bookmark[] marks = ctx.bm.getBookmarks(a);
-		if (marks.length > 0) {
-			r.put("bookmark", marks[0].getCategory() + (marks[0].getComment().isEmpty() ? "" : ": " + marks[0].getComment()));
+		for (Bookmark mark : ctx.bm.getBookmarks(a)) {
+			if (Debug.isBreakpoint(mark)) {
+				continue;       // breakpoints are drawn in the margin, not as bookmarks
+			}
+			r.put("bookmark", mark.getCategory() + (mark.getComment().isEmpty() ? "" : ": " + mark.getComment()));
+			break;
+		}
+		if (cu instanceof Data dd && dd.getNumComponents() > 0) {
+			r.put("components", dd.getNumComponents());
+		}
+		if (!listingFields.isEmpty()) {
+			extraFields(cu, a, ctx, r);
 		}
 		if (headers) {
 			Function f = ctx.fm.getFunctionAt(a);
@@ -618,6 +1060,67 @@ final class Session {
 		return map("start", str(base), "bytes", bytes, "block", block != null ? block.getName() : null);
 	}
 
+	/**
+	 * A page of memory for the byte viewer: bytes (-1 where there are none), what each byte is
+	 * (0 undefined, 1 instruction, 2 data) and, for every pointer-sized group, whether its value is an address.
+	 */
+	Map<String, Object> byteView(Address address, int length, int align) {
+		length = Math.max(16, Math.min(length, 65536));
+		int step = Math.max(1, align);
+		Address base = address.getNewAddress(address.getOffset() - Long.remainderUnsigned(address.getOffset(), step));
+		ghidra.program.model.mem.Memory mem = program.getMemory();
+		Listing listing = program.getListing();
+		List<Integer> bytes = new ArrayList<>(length);
+		List<Integer> kinds = new ArrayList<>(length);
+		for (int i = 0; i < length; i++) {
+			Address a;
+			try {
+				a = base.add(i);
+			}
+			catch (AddressOutOfBoundsException e) {
+				break;
+			}
+			try {
+				bytes.add(mem.getByte(a) & 0xff);
+			}
+			catch (MemoryAccessException e) {
+				bytes.add(-1);
+			}
+			CodeUnit cu = listing.getCodeUnitContaining(a);
+			kinds.add(cu instanceof Instruction ? 1 : cu instanceof Data d && d.isDefined() ? 2 : 0);
+		}
+		int ptr = program.getDefaultPointerSize();
+		boolean big = mem.isBigEndian();
+		List<Boolean> pointers = new ArrayList<>();
+		for (int i = 0; i + ptr <= bytes.size(); i += ptr) {
+			long v = 0;
+			boolean ok = true;
+			for (int b = 0; b < ptr; b++) {
+				int x = bytes.get(big ? i + b : i + ptr - 1 - b);
+				if (x < 0) {
+					ok = false;
+					break;
+				}
+				v = (v << 8) | x;
+			}
+			boolean valid = false;
+			if (ok && v != 0) {
+				try {
+					valid = mem.contains(base.getNewAddress(v));
+				}
+				catch (Exception e) {
+					valid = false;
+				}
+			}
+			pointers.add(valid);
+		}
+		MemoryBlock block = mem.getBlock(address);
+		return map("start", str(base), "bytes", bytes, "kinds", kinds, "pointers", pointers, "pointerSize", ptr,
+			"bigEndian", big, "block", block != null ? block.getName() : null,
+			"blockStart", block != null ? str(block.getStart()) : null, "blockEnd", block != null ? str(block.getEnd()) : null,
+			"min", str(mem.getMinAddress()), "max", str(mem.getMaxAddress()));
+	}
+
 	// ---------------------------------------------------------------- xrefs / function info
 
 	List<Map<String, Object>> xrefs(Address address) {
@@ -630,6 +1133,20 @@ final class Session {
 			Function f = fm.getFunctionContaining(ref.getFromAddress());
 			list.add(map("from", str(ref.getFromAddress()), "type", ref.getReferenceType().getName(),
 				"function", f != null ? f.getName(true) : null));
+		}
+		if (listingFields.contains("thunkXrefs")) {
+			// references that reach the function through its thunks
+			for (Address thunk : thunksOf(address)) {
+				Function t = fm.getFunctionAt(thunk);
+				for (Reference ref : program.getReferenceManager().getReferencesTo(thunk)) {
+					if (list.size() >= 2000) {
+						break;
+					}
+					Function f = fm.getFunctionContaining(ref.getFromAddress());
+					list.add(map("from", str(ref.getFromAddress()), "type", ref.getReferenceType().getName(),
+						"function", f != null ? f.getName(true) : null, "via", t != null ? t.getName() : str(thunk)));
+				}
+			}
 		}
 		return list;
 	}
@@ -764,6 +1281,9 @@ final class Session {
 	Object deleteBookmark(Address address) throws Exception {
 		return edit("Quitar marcador", () -> {
 			for (Bookmark b : program.getBookmarkManager().getBookmarks(address)) {
+				if (Debug.isBreakpoint(b)) {
+					continue;
+				}
 				program.getBookmarkManager().removeBookmark(b);
 			}
 			return true;
@@ -772,7 +1292,7 @@ final class Session {
 
 	// ---------------------------------------------------------------- edits: decompiler variables & signatures
 
-	private HighSymbol findLocal(HighFunction hf, String name) {
+	HighSymbol findLocal(HighFunction hf, String name) {
 		Iterator<HighSymbol> it = hf.getLocalSymbolMap().getSymbols();
 		while (it.hasNext()) {
 			HighSymbol s = it.next();
@@ -1134,6 +1654,115 @@ final class Session {
 		}
 		list.sort(Comparator.comparing(o -> (String) o.get("name")));
 		return list;
+	}
+
+	/** Sub-options of one analyzer ("Analyzer.Option name"), typed. */
+	List<Map<String, Object>> analyzerOptions(String analyzer) {
+		Options opts = program.getOptions(Program.ANALYSIS_PROPERTIES);
+		List<Map<String, Object>> list = new ArrayList<>();
+		String prefix = analyzer + ".";
+		for (String name : opts.getOptionNames()) {
+			if (!name.startsWith(prefix)) {
+				continue;
+			}
+			OptionType t = opts.getType(name);
+			String type = t == OptionType.BOOLEAN_TYPE ? "bool"
+					: t == OptionType.INT_TYPE || t == OptionType.LONG_TYPE || t == OptionType.DOUBLE_TYPE ? "number"
+					: t == OptionType.ENUM_TYPE ? "enum" : t == OptionType.STRING_TYPE ? "text" : null;
+			if (type == null) {
+				continue;
+			}
+			Object value = opts.getObject(name, null);
+			Map<String, Object> m = map("name", name, "label", name.substring(prefix.length()), "type", type,
+				"value", value != null ? (value instanceof java.lang.Enum<?> e ? e.name() : value.toString()) : "",
+				"description", opts.getDescription(name));
+			if (value instanceof java.lang.Enum<?> e) {
+				List<String> choices = new ArrayList<>();
+				for (Object c : e.getDeclaringClass().getEnumConstants()) {
+					choices.add(((java.lang.Enum<?>) c).name());
+				}
+				m.put("choices", choices);
+			}
+			list.add(m);
+		}
+		return list;
+	}
+
+	@SuppressWarnings({ "unchecked", "rawtypes" })
+	Object setAnalyzerOption(String name, String value) throws Exception {
+		return edit("Opciones de análisis", () -> {
+			Options opts = program.getOptions(Program.ANALYSIS_PROPERTIES);
+			OptionType t = opts.getType(name);
+			if (t == OptionType.BOOLEAN_TYPE) {
+				opts.setBoolean(name, Boolean.parseBoolean(value));
+			}
+			else if (t == OptionType.INT_TYPE) {
+				opts.setInt(name, Integer.parseInt(value.trim()));
+			}
+			else if (t == OptionType.LONG_TYPE) {
+				opts.setLong(name, Long.parseLong(value.trim()));
+			}
+			else if (t == OptionType.DOUBLE_TYPE) {
+				opts.setDouble(name, Double.parseDouble(value.trim()));
+			}
+			else if (t == OptionType.ENUM_TYPE) {
+				java.lang.Enum<?> current = (java.lang.Enum<?>) opts.getObject(name, null);
+				opts.setEnum(name, java.lang.Enum.valueOf((Class) current.getDeclaringClass(), value));
+			}
+			else {
+				opts.setString(name, value);
+			}
+			return true;
+		});
+	}
+
+	/** Runs a single analyzer once over the whole program, in the background (One Shot analysis). */
+	void runAnalyzer(String name) {
+		if (isAnalyzing()) {
+			throw new IllegalStateException("Ya hay un análisis en marcha");
+		}
+		AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(program);
+		mgr.initializeOptions();
+		ghidra.app.services.Analyzer analyzer = mgr.getAnalyzer(name);
+		if (analyzer == null) {
+			throw new IllegalArgumentException("Analizador desconocido: " + name);
+		}
+		ProgressMonitor monitor = new ProgressMonitor();
+		analysisMonitor = monitor;
+		Thread t = new Thread(() -> {
+			int tx = program.startTransaction(name);
+			try {
+				mgr.scheduleOneTimeAnalysis(analyzer, program.getMemory());
+				mgr.startAnalysis(monitor);
+			}
+			catch (Throwable e) {
+				e.printStackTrace();
+			}
+			finally {
+				program.endTransaction(tx, true);
+			}
+			invalidate();
+			analysisThread = null;
+			analysisMonitor = null;
+			server.send(map("event", "analysisDone", "session", id, "completed", !monitor.isCancelled()));
+		}, "studio-oneshot");
+		t.setDaemon(true);
+		analysisThread = t;
+		server.send(map("event", "analysisStarted", "session", id));
+		t.start();
+	}
+
+	Object loadPdb(String path) throws Exception {
+		java.io.File file = new java.io.File(path);
+		if (!file.isFile()) {
+			throw new java.io.FileNotFoundException("No existe: " + path);
+		}
+		edit("Cargar PDB", () -> {
+			ghidra.app.plugin.core.analysis.PdbUniversalAnalyzer.setPdbFileOption(program, file);
+			return true;
+		});
+		runAnalyzer("PDB Universal");
+		return true;
 	}
 
 	Object setAnalysisOptions(Map<String, Boolean> values) throws Exception {

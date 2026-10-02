@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         @Bindable var model = model
@@ -19,8 +20,25 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 960, minHeight: 600)
+        .onChange(of: model.windowRequest) { _, id in
+            guard let id else { return }
+            // a docked panel is shown in its dock instead of in a window
+            if !model.dock.reveal(window: id) { openWindow(id: id) }
+            model.windowRequest = nil
+        }
         .sheet(item: $model.importRequest) { request in ImportSheet(request: request) }
+        .sheet(item: $model.containerRequest) { request in ContainerBrowserSheet(request: request) }
+        .sheet(item: $model.batchRequest) { request in BatchImportSheet(request: request) }
         .sheet(item: $model.editRequest) { request in EditSheet(request: request) }
+        .sheet(item: model.formBinding("main")) { request in FormSheet(request: request) }
+        .sheet(item: $model.mainTypeUses) { request in TypeUsesSheet(request: request) }
+        .overlay(alignment: .bottom) {
+            if let note = model.statusMessage {
+                Text(note).font(.callout).padding(.horizontal, 14).padding(.vertical, 8)
+                    .glassEffect(.regular, in: .capsule).padding(.bottom, 18)
+                    .transition(.opacity)
+            }
+        }
         .alert("Ghidra Studio", isPresented: Binding(get: { model.errorMessage != nil },
                                                      set: { if !$0 { model.errorMessage = nil } })) {
             Button(tr("Aceptar"), role: .cancel) {}
@@ -280,7 +298,7 @@ struct ClassicHandoffView: View {
                 .foregroundStyle(.tint)
             Text(tr("Proyecto abierto en Ghidra clásico"))
                 .font(.title.weight(.semibold))
-            Text(tr("«%@» está en uso en el Ghidra clásico.\nCuando termines (depurador, emulador, Version Tracking…), cierra el clásico y vuelve aquí.", "\(((gpr as NSString).lastPathComponent as NSString).deletingPathExtension)"))
+            Text(tr("«%@» está en uso en el Ghidra clásico.\nCuando cierres el clásico, el proyecto volverá a abrirse aquí.", "\(((gpr as NSString).lastPathComponent as NSString).deletingPathExtension)"))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
             Button {

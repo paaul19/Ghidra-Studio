@@ -57,13 +57,14 @@ final class Scripts {
 			}
 			for (ResourceFile f : files) {
 				String name = f.getName();
-				if (!name.endsWith(".java") || !seen.add(name)) {
+				boolean python = name.endsWith(".py");
+				if (!(name.endsWith(".java") || python && Python.available()) || !seen.add(name)) {
 					continue;
 				}
 				Map<String, String> meta = header(f);
 				out.add(map("name", name, "path", f.getAbsolutePath(), "category", meta.getOrDefault("category", ""),
 					"description", meta.getOrDefault("description", ""),
-					"user", dir.equals(user)));
+					"language", python ? "python" : "java", "user", dir.equals(user)));
 			}
 		}
 		out.sort(Comparator.comparing(o -> ((String) o.get("name")).toLowerCase()));
@@ -80,7 +81,7 @@ final class Scripts {
 			int n = 0;
 			while ((line = r.readLine()) != null && n++ < 80) {
 				String t = line.trim();
-				boolean comment = t.startsWith("//") || t.startsWith("/*") || t.startsWith("*");
+				boolean comment = t.startsWith("//") || t.startsWith("/*") || t.startsWith("*") || t.startsWith("#");
 				if (!comment) {
 					current = null;
 					if (!t.isEmpty() && !t.startsWith("import") && !t.startsWith("package")) {
@@ -92,7 +93,7 @@ final class Scripts {
 					current = new ArrayList<>();
 					blocks.add(current);
 				}
-				t = t.replaceFirst("^(//+|/\\*+|\\*+/?)\\s?", "").trim();
+				t = t.replaceFirst("^(//+|/\\*+|\\*+/?|#+)\\s?", "").trim();
 				if (t.startsWith("@category")) {
 					meta.put("category", t.substring(9).trim());
 				}
@@ -125,14 +126,18 @@ final class Scripts {
 	}
 
 	static Map<String, Object> save(String name, String source) throws IOException {
-		String file = name.endsWith(".java") ? name : name + ".java";
+		String file = name.endsWith(".java") || name.endsWith(".py") ? name : name + ".java";
 		File f = new File(userDirectory(), file);
 		Files.writeString(f.toPath(), source, StandardCharsets.UTF_8);
 		return map("path", f.getAbsolutePath(), "name", file);
 	}
 
-	static Map<String, Object> run(Session s, String path, String address) throws Exception {
+	static Map<String, Object> run(Session s, String path, String address, String[] args,
+			ghidra.util.task.TaskMonitor monitor) throws Exception {
 		init();
+		if (path.endsWith(".py")) {
+			Python.require();
+		}
 		ResourceFile file = new ResourceFile(new File(path));
 		ResourceFile parent = file.getParentFile();
 		if (GhidraScriptUtil.getBundleHost().getExistingGhidraBundle(parent) == null) {
@@ -148,6 +153,10 @@ final class Scripts {
 		String error = null;
 		try {
 			GhidraScript script = provider.getScriptInstance(file, writer);
+			if (args != null && args.length > 0) {
+				// In headless mode askString/askInt/askFile... consume these in order.
+				script.setScriptArgs(args);
+			}
 			ProgramLocation loc = null;
 			if (address != null) {
 				Address a = s.addr(address);
@@ -157,7 +166,7 @@ final class Scripts {
 			int tx = s.program.startTransaction("Script " + file.getName());
 			boolean ok = false;
 			try {
-				script.execute(state, new TaskMonitorAdapter(true), writer);
+				script.execute(state, monitor, writer);
 				ok = true;
 			}
 			finally {
@@ -169,10 +178,18 @@ final class Scripts {
 			while (root.getCause() != null && root.getCause() != root) {
 				root = root.getCause();
 			}
-			error = root.getClass().getSimpleName() + ": " + root.getMessage();
-			t.printStackTrace(writer);
+			if (monitor.isCancelled()) {
+				error = "Cancelado";
+			}
+			else {
+				error = root.getClass().getSimpleName() + ": " + root.getMessage();
+				t.printStackTrace(writer);
+			}
 		}
 		writer.flush();
+		if (error == null && monitor.isCancelled()) {
+			error = "Cancelado";
+		}
 		s.invalidate();
 		return map("output", buffer.toString(), "error", error, "millis", System.currentTimeMillis() - start);
 	}
